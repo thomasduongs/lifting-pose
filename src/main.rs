@@ -4,6 +4,8 @@ mod detector;
 mod landmarks;
 mod motion3d;
 mod pose;
+mod recording;
+mod replay;
 mod tracking;
 mod twin;
 
@@ -33,6 +35,21 @@ use std::{
     about = "Closest-person body, hand and foot estimation with OpenCV (CPU)"
 )]
 struct Args {
+    /// Capture a new session (or import --input), then build its 3D twin.
+    #[arg(long, conflicts_with_all = ["replay", "no_3d"])]
+    record: Option<PathBuf>,
+    /// Stop camera recording after this many seconds; otherwise q / Esc stops it.
+    #[arg(long, requires = "record", value_parser = parse_positive)]
+    record_seconds: Option<f64>,
+    /// Replay an exported skeletal twin without loading any neural models.
+    #[arg(long, conflicts_with_all = ["record", "input", "camera"])]
+    replay: Option<PathBuf>,
+    /// Replay only this subject segment; default replays the full recording.
+    #[arg(long)]
+    replay_subject: Option<usize>,
+    /// Override recorded replay timing with a constant frame rate.
+    #[arg(long, requires = "replay", value_parser = parse_positive)]
+    replay_fps: Option<f64>,
     #[arg(long, default_value = "models/rtmw-m.onnx")]
     model: PathBuf,
     /// MotionAGFormer-XS H36M ONNX export for 3D body lifting.
@@ -352,7 +369,56 @@ fn process(
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if let Some(path) = &args.replay {
+        return replay::run(
+            path,
+            replay::Options {
+                output: args.output.as_deref(),
+                no_display: args.no_display,
+                subject: args.replay_subject,
+                fps: args.replay_fps,
+                max_frames: args.max_frames,
+            },
+        );
+    }
+    let captured = if let Some(directory) = args.record.clone() {
+        for path in [&args.model, &args.motion_model] {
+            ensure!(
+                path.is_file(),
+                "Model not found: {}. Set up models before recording.",
+                path.display()
+            );
+        }
+        if !args.no_detection && args.bbox.is_none() {
+            ensure!(
+                args.detector_model.is_file(),
+                "Person detector not found: {}",
+                args.detector_model.display()
+            );
+        }
+        let captured = recording::capture(
+            &directory,
+            args.input.as_deref(),
+            args.camera.unwrap_or(0),
+            args.no_display,
+            args.record_seconds,
+            args.max_frames,
+        )?;
+        args.input = Some(captured.source.clone());
+        args.camera = None;
+        if args.twin_output == PathBuf::from("output/twin.json") {
+            args.twin_output = directory.join("twin.json");
+        }
+        if args.output.is_none() {
+            args.output = Some(directory.join("tracked.mp4"));
+        }
+        // The recording preview already closed. Analyze every saved frame without a second window.
+        args.no_display = true;
+        Some(captured)
+    } else {
+        None
+    };
     // Avoid truncating an input or model through an accidentally reused output path.
     for destination in args
         .output
@@ -424,7 +490,10 @@ fn main() -> Result<()> {
         .map(|p| imgcodecs::have_image_reader(p))
         .transpose()?
         .unwrap_or(false);
+    let mut timeline = Vec::new();
+    let mut timeline_fps = 1.0;
     if is_image {
+        timeline.push(0.0);
         let input = args.input.as_ref().unwrap();
         let mut image = imgcodecs::imread(input, imgcodecs::IMREAD_COLOR)?;
         ensure!(!image.empty(), "Cannot read image {}", input.display());
@@ -466,13 +535,20 @@ fn main() -> Result<()> {
         } else {
             30.0
         };
+        timeline_fps = fps;
         let mut writer: Option<videoio::VideoWriter> = None;
         let mut index = 0;
+        let started = Instant::now();
         loop {
             let mut frame = Mat::default();
             if !capture.read(&mut frame)? || frame.empty() {
                 break;
             }
+            timeline.push(if args.input.is_some() {
+                index as f64 / fps
+            } else {
+                started.elapsed().as_secs_f64()
+            });
             process(
                 &mut frame,
                 &mut estimator,
@@ -533,8 +609,54 @@ fn main() -> Result<()> {
     }
     if !args.no_3d {
         eprintln!("Finalizing skeletal twin with one fixed shape per subject segment...");
+        let source_video = if is_image {
+            None
+        } else {
+            args.input
+                .as_ref()
+                .map(|source| {
+                    let source = source.canonicalize()?;
+                    let directory = args
+                        .twin_output
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(std::path::Path::new("."));
+                    std::fs::create_dir_all(directory)?;
+                    let directory = directory.canonicalize()?;
+                    Ok::<_, anyhow::Error>(
+                        source
+                            .strip_prefix(directory)
+                            .unwrap_or(&source)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .transpose()?
+        };
+        let timestamps_seconds = if let Some(captured) = &captured {
+            captured
+                .timestamps_seconds
+                .iter()
+                .copied()
+                .take(timeline.len())
+                .collect()
+        } else {
+            timeline
+        };
+        twin_recorder.set_timing(twin::RecordingTiming {
+            fps: captured.as_ref().map(|c| c.fps).unwrap_or(timeline_fps),
+            frame_count: timestamps_seconds.len() as u64,
+            timestamps_seconds,
+            source_video,
+        });
         twin_recorder.save(&args.twin_output)?;
         eprintln!("Saved skeletal twin: {}", args.twin_output.display());
+        if args.record.is_some() {
+            eprintln!(
+                "Replay with: cargo run --release -- --replay {}",
+                args.twin_output.display()
+            );
+        }
     }
     Ok(())
 }

@@ -8,6 +8,87 @@ separate ONNX Runtime installation is required.
 A skeletal twin fits the 3D observations using shared body dimensions and
 per-frame rotations, preserving bone lengths through forward kinematics.
 
+## Record and replay a 3D twin
+
+Record your webcam into a new session directory:
+
+```sh
+cargo run --release -- --record output/session-01 --camera 0
+```
+
+The recording preview opens immediately after the camera is ready. Press **q**
+or **Esc** to stop recording; the app then processes the entire saved video and
+finalizes the twin. Capture runs without neural inference so model processing
+does not reduce capture frame rate. Analysis takes additional time after capture.
+Use a new session directory for each recording; existing session artifacts are
+not overwritten by record mode.
+
+The session contains:
+
+- `source.mp4`: unannotated footage (silent; at most one border row/column is
+  cropped when the source dimensions are odd, for MP4 encoding).
+- `capture.json`: reported capture FPS and per-frame timestamps.
+- `tracked.mp4`: annotated pose/twin preview.
+- `twin.json`: shared body dimensions, per-frame rotations, root estimates, and
+  recording timing used by replay.
+
+For a timed capture, add `--record-seconds 10`. A headless camera recording
+(`--no-display`) requires `--record-seconds` or `--max-frames`. Stop normally with
+q/Esc or the duration/frame limit so video and twin files can be finalized.
+Recording needs the same local model files as tracking.
+
+You can also import an existing video into a session and build its twin:
+
+```sh
+cargo run --release -- --record output/session-02 --input lifting.mp4 --no-display
+```
+
+Replay the finalized 3D skeleton:
+
+```sh
+cargo run --release -- --replay output/session-01/twin.json
+```
+
+Replay reconstructs joint positions using the saved hierarchy, shared rest
+offsets, and quaternion forward kinematics. **No neural models, Python, camera,
+or original video are required for replay.** Recorded timestamps determine
+playback timing. Frames without a reliable saved pose show an empty scene;
+no poses are invented across tracking gaps.
+
+| Replay key | Action |
+| --- | --- |
+| Space | Pause / play; restart after the end |
+| J / L | Previous / next frame (pauses playback) |
+| A / D | Orbit left / right |
+| W / S | Tilt the view |
+| + / - | Zoom |
+| 1 / 2 / 3 | Front / side / oblique view |
+| F | Toggle in-place view / approximate root motion |
+| N | Toggle joint names |
+| [ / ] | Decrease / increase playback speed |
+| R | Reset view |
+| Q / Esc | Close replay |
+
+Select another tracked subject segment with `--replay-subject 1`. Replay covers
+the selected segment's first through last reliable frame, retaining internal
+gaps. Older twin files without timing metadata default to 30 FPS; override timing
+with `--replay-fps 15`. The 3D view shows the 17-joint skeletal body, not a skin
+mesh or 3D fingers/toes. Root motion remains the approximate camera-space estimate
+described below.
+
+Export a shareable video of the 3D replay without opening a window:
+
+```sh
+cargo run --release -- --replay output/session-01/twin.json \
+  --output output/session-01/replay3d.mp4 --no-display
+```
+
+Replay video exports use a 1024×768 oblique in-place view. Irregular capture
+timestamps are resampled to constant FPS for MP4. Remove `--no-display` to export
+first and then open interactive replay. `--max-frames` limits the source-frame
+span for preview/export. The source video and twin JSON are protected against
+being selected as the replay output.
+
 Supports images, video files, and webcams, annotated image/video output, and
 JSON Lines keypoint export. The default model uses 192×256 input (width × height)
 and predicts 133 COCO-WholeBody landmarks:
@@ -392,6 +473,9 @@ cargo test
   IK, approximate camera root translation, and final fixed-shape recording export.
 - `src/tracking.rs`: learned-dimension landmark stabilization, bounded inferred
   joint display, and crop feedback between detector refreshes.
+- `src/recording.rs`: unannotated capture/import and capture timing, before inference.
+- `src/replay.rs`: model-free twin loading, FK reconstruction, timed interactive
+  playback, orbit/zoom controls, and headless 3D video export.
 - `scripts/export_motionagformer.py`: one-time checkpoint-to-ONNX conversion and
   numerical parity validation; not used by the running app.
 - `src/detector.rs`: YOLOX-s RGB letterbox preprocessing, person-class decoding,
