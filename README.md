@@ -1,7 +1,8 @@
 # lifting-pose
 
 Rust CLI using **OpenCV** for capture, preprocessing, ONNX inference, and skeleton
-rendering with **RTMW-m WholeBody** (default) or **RTMPose-m**. Runs on CPU; no Python inference environment or
+rendering with **RTMW-m WholeBody** (default) or **RTMPose-m**, followed by
+**MotionAGFormer-XS** temporal 3D body lifting. Runs on CPU; no Python inference environment or
 separate ONNX Runtime installation is required.
 
 Supports images, video files, and webcams, annotated image/video output, and
@@ -37,8 +38,13 @@ force immediate detection. A moving person can leave the cached crop between
 refreshes, so use a smaller interval for fast motion. Persistent identity tracking and lifting form analysis are not implemented.
 
 Joint angles are displayed automatically beside the selected person's joints.
-Yellow labels show left/right shoulder, elbow, wrist, hip, knee, and ankle angles
-in degrees, when their landmarks are reliable. These are unsigned **2D interior
+With 3D lifting enabled, yellow shoulder, elbow, hip, and knee labels use inferred
+**3D interior angles** and carry a `3D` suffix. Wrist and ankle angles retain a
+`2D` suffix because MotionAGFormer has no finger or toe outputs. A small inset
+shows an oblique view of the predicted 3D body skeleton. The existing JSON
+`angles` field still contains all twelve 2D angles; 3D angles are separate.
+
+Use `--no-3d` to disable lifting and display only 2D labels. These are unsigned **2D interior
 angles** (0–180°) measured in the image plane: a straight joint is 180°, not 0°.
 Perspective and camera angle affect the measurements; these are not 3D joint
 rotations or anatomical flexion/extension measurements.
@@ -57,10 +63,45 @@ ankle-to-big-toe direction as a foot approximation. All three landmarks must be
 inside the frame and meet `--threshold`; missing, low-confidence, or coincident
 landmarks produce no label and a JSON `degrees: null` value.
 
+## MotionAGFormer 3D body estimation
+
+The default 3D model is the official **MotionAGFormer-XS H36M** checkpoint,
+with 27 frames and 17 Human3.6M joints. The first 17 COCO body landmarks from
+RTMW/RTMPose are converted to H36M, including synthesized pelvis, spine, thorax,
+and head input landmarks, then normalized using the frame width and aspect ratio.
+Conversion follows the [official demo preprocessing](https://github.com/TaatiTeam/MotionAGFormer/blob/master/demo/lib/preprocess.py).
+
+The app keeps the latest 27 poses and uses the model's newest-frame output.
+Short histories repeat the earliest pose on the left; the inset displays the
+number of real history frames collected. This is a streaming adaptation of the
+official full-clip demo and uses no future frames or flip augmentation. Its
+accuracy may differ from the published offline evaluation. It adds computation:
+in a short local CPU test, cached-detector frames with 3D lifting took about
+72–90 ms, versus roughly 37 ms without lifting in an earlier test. These are
+illustrative timings, not a controlled benchmark.
+
+`pose3d` in each person's JSON contains 17 named XYZ `joints`, eight body `angles`,
+`history_frames`, and coordinate metadata. The pelvis is the origin; coordinates
+are **root-relative camera-space model units**, not meters, world coordinates,
+or camera distance. Each joint's `input_score` comes from the 2D input; it is not
+a confidence produced by the 3D model. The model predicts body structure, not
+3D fingers/toes or measured spine curvature, and does not correct the exported
+2D keypoints or supply persistent person identities.
+
+History resets when no person is selected, the torso becomes unreliable, frame
+resolution changes, or the selected box has little overlap with its predecessor.
+That overlap check reduces mixing across person switches but is not an identity
+tracker. Invalid limb inputs reuse the previous coordinate with zero input
+confidence (or the pelvis on the first frame). If the torso is unreliable,
+`pose3d` is null and the display falls back to 2D angles. Low-confidence input
+joints suppress affected 3D angle labels even when the model predicts XYZ.
+
 ## Setup
 
-Requires Rust 1.88+, OpenCV 4.8+ or 5.x with DNN, videoio, highgui, imgproc, and
+Requires Rust 1.88+ and **OpenCV 5** for the validated MotionAGFormer graph engine,
+with DNN, videoio, highgui, imgproc, and
 imgcodecs modules, plus Clang/libclang for generating Rust bindings.
+The 2D-only pipeline (`--no-3d`) also supports OpenCV 4.8+.
 
 macOS (Homebrew):
 
@@ -91,10 +132,13 @@ before the first run; the body-only model is optional:
 | RTMW-m (default) | `models/rtmw-m.onnx` (~59 MiB) | 133: body, feet, face, hands | [Download](https://download.openmmlab.com/mmpose/v1/projects/rtmw/onnx_sdk/rtmw-dw-m-s_simcc-cocktail14_270e-256x192_20231122.zip) |
 | RTMPose-m | `models/rtmpose-m.onnx` (~52 MiB) | 17: body only | [Download](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip) |
 | YOLOX-s (detector) | `models/yolox-s.onnx` (~34 MiB) | Person bounding boxes | [Download ONNX](https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx) |
+| MotionAGFormer-XS | `models/motionagformer-xs.onnx` (~9 MiB) | 17 inferred 3D body joints | [Official H36M checkpoint](https://drive.google.com/file/d/1Pab7cPvnWG8NOVd0nnL1iqAfYCUY4hDH/view) (export below) |
 
 On another machine, download the required archive and extract its `end2end.onnx`
 file to the corresponding model path above. For YOLOX-s, download the ONNX file
-directly to `models/yolox-s.onnx`. No download script is required.
+directly to `models/yolox-s.onnx`. The MotionAGFormer ONNX file is already exported
+in this workspace. For a fresh clone, export its checkpoint as described below,
+or pass `--no-3d` to run the 2D pipeline.
 Models and generated outputs are excluded from Git; `Cargo.lock` is included for
 reproducible Rust dependencies.
 Use `--model /path/to/model.onnx` to load a compatible model. The supported export
@@ -103,6 +147,32 @@ has a float32 `[1,3,256,192]` input and two raw float32 SimCC outputs,
 output shapes. Other input resolutions and landmark layouts require code changes.
 `--detector-model /path/to/yolox-s.onnx` selects the person detector; it must use
 the documented 640×640 export with raw float32 `[1,8400,85]` output.
+
+### One-time MotionAGFormer export
+
+Python is needed only to convert the official PyTorch checkpoint. Inference in
+the app remains Rust/OpenCV, with no ONNX Runtime dependency. Use Python 3.13 and
+the verified export dependency versions:
+
+```sh
+python3.13 -m venv .venv-motion
+.venv-motion/bin/pip install -r scripts/requirements-motion-export.txt
+mkdir -p output models
+git clone https://github.com/TaatiTeam/MotionAGFormer.git output/MotionAGFormer
+git -C output/MotionAGFormer checkout 4756fd1eb7cc73f0e991f091ff2280e030ab85f3
+curl -fL 'https://drive.google.com/uc?export=download&id=1Pab7cPvnWG8NOVd0nnL1iqAfYCUY4hDH' \
+  -o models/motionagformer-xs.pth
+.venv-motion/bin/python scripts/export_motionagformer.py \
+  --source output/MotionAGFormer --checkpoint models/motionagformer-xs.pth
+```
+
+The exporter checks the ONNX graph and compares ONNX Runtime output with PyTorch.
+It also writes binary validation fixtures beside the model. To check Rust/OpenCV
+against the same PyTorch fixture, run `cargo run --example check_motion_export`.
+The fixed float32 input/output shapes are `[1,27,17,3]`; the input channels are
+normalized x, normalized y, and 2D confidence. Select a compatible export with
+`--motion-model /path/to/motionagformer-xs.onnx`.
+Upstream MotionAGFormer is [Apache-2.0 licensed](https://github.com/TaatiTeam/MotionAGFormer/blob/master/LICENSE).
 
 If OpenCV discovery fails, ensure its pkg-config directory is on
 `PKG_CONFIG_PATH`, for example on Homebrew:
@@ -194,7 +264,11 @@ cargo test
   NCHW blob, OpenCV DNN CPU inference, SimCC argmax decoding, inverse crop mapping,
   and COCO skeleton rendering.
 - `src/detection_cache.rs`: periodic detector scheduling and selected-crop caching.
-- `src/angles.rs`: confidence-gated 2D joint angle calculations and degree labels.
+- `src/angles.rs`: confidence-gated 2D joint angle calculations and 2D/3D degree labels.
+- `src/motion3d.rs`: COCO-to-H36M conversion, temporal buffering, native
+  MotionAGFormer inference, root-relative XYZ, 3D angles, and skeleton inset.
+- `scripts/export_motionagformer.py`: one-time checkpoint-to-ONNX conversion and
+  numerical parity validation; not used by the running app.
 - `src/detector.rs`: YOLOX-s RGB letterbox preprocessing, person-class decoding,
   coordinate rescaling/clipping, non-maximum suppression, and closest-person selection. Based on the
   [official OpenCV Zoo inference implementation](https://github.com/opencv/opencv_zoo/tree/main/models/object_detection_yolox).

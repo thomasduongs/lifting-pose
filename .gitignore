@@ -2,3 +2,5 @@
 /models/*
 !/models/.gitkeep
 /output/
+.venv*/
+__pycache__/

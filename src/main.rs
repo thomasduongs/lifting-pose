@@ -2,12 +2,14 @@ mod angles;
 mod detection_cache;
 mod detector;
 mod landmarks;
+mod motion3d;
 mod pose;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use detection_cache::DetectionCache;
 use detector::PersonDetector;
+use motion3d::MotionLifter;
 use opencv::{
     core::{Mat, Point, Rect, Scalar, Size, Vector},
     highgui, imgcodecs, imgproc,
@@ -31,6 +33,12 @@ use std::{
 struct Args {
     #[arg(long, default_value = "models/rtmw-m.onnx")]
     model: PathBuf,
+    /// MotionAGFormer-XS H36M ONNX export for 3D body lifting.
+    #[arg(long, default_value = "models/motionagformer-xs.onnx")]
+    motion_model: PathBuf,
+    /// Disable 3D lifting and use only 2D pose/angles.
+    #[arg(long)]
+    no_3d: bool,
     /// YOLOX-s detector (OpenCV Zoo raw 640x640 export).
     #[arg(long, default_value = "models/yolox-s.onnx")]
     detector_model: PathBuf,
@@ -123,6 +131,7 @@ struct PersonPose {
     detection_score: Option<f32>,
     keypoints: Vec<Keypoint>,
     angles: Vec<angles::JointAngle>,
+    pose3d: Option<motion3d::Pose3d>,
 }
 
 #[derive(Serialize)]
@@ -140,6 +149,7 @@ fn process(
     estimator: &mut PoseEstimator,
     detector: &mut Option<PersonDetector>,
     detection_cache: &mut DetectionCache,
+    lifter: &mut Option<MotionLifter>,
     args: &Args,
     index: u64,
     json: &mut Option<BufWriter<File>>,
@@ -171,6 +181,11 @@ fn process(
         );
         vec![(bbox, None)]
     };
+    if crops.is_empty() {
+        if let Some(lifter) = lifter.as_mut() {
+            lifter.reset();
+        }
+    }
     // Infer every crop from the original frame before adding any annotations.
     let mut people = Vec::with_capacity(crops.len());
     for (person_index, (bbox, detection_score)) in crops.into_iter().enumerate() {
@@ -180,12 +195,17 @@ fn process(
             args.threshold,
             Size::new(frame.cols(), frame.rows()),
         );
+        let pose3d = match lifter.as_mut() {
+            Some(lifter) => lifter.infer(&keypoints, bbox, frame.size()?, args.threshold)?,
+            None => None,
+        };
         people.push(PersonPose {
             person_index,
             bbox,
             detection_score,
             keypoints,
             angles,
+            pose3d,
         });
     }
     let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -236,7 +256,20 @@ fn process(
         )?;
     }
     for person in &people {
-        angles::draw(frame, &person.keypoints, &person.angles)?;
+        if let Some(pose3d) = &person.pose3d {
+            // The 3D model has no finger/toe landmarks; keep wrist/ankle labels in 2D.
+            let remaining: Vec<_> = person
+                .angles
+                .iter()
+                .filter(|a| !pose3d.angles.iter().any(|b| b.joint == a.joint))
+                .cloned()
+                .collect();
+            angles::draw(frame, &person.keypoints, &remaining)?;
+            angles::draw_labeled(frame, &person.keypoints, &pose3d.angles, "3D")?;
+            motion3d::draw(frame, pose3d)?;
+        } else {
+            angles::draw(frame, &person.keypoints, &person.angles)?;
+        }
     }
     if index == 0 || index.is_multiple_of(30) {
         eprintln!(
@@ -251,7 +284,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
     // Avoid truncating an input or model through an accidentally reused output path.
     for destination in [&args.output, &args.json].into_iter().flatten() {
-        for source in args.input.iter().chain([&args.model, &args.detector_model]) {
+        for source in
+            args.input
+                .iter()
+                .chain([&args.model, &args.detector_model, &args.motion_model])
+        {
             if destination.exists() && source.exists() {
                 ensure!(
                     destination.canonicalize()? != source.canonicalize()?,
@@ -279,6 +316,11 @@ fn main() -> Result<()> {
         Some(PersonDetector::new(&args.detector_model)?)
     };
     let mut detection_cache = DetectionCache::new(args.detection_interval);
+    let mut lifter = if args.no_3d {
+        None
+    } else {
+        Some(MotionLifter::new(&args.motion_model)?)
+    };
     let mut json = args
         .json
         .as_ref()
@@ -304,6 +346,7 @@ fn main() -> Result<()> {
             &mut estimator,
             &mut detector,
             &mut detection_cache,
+            &mut lifter,
             &args,
             0,
             &mut json,
@@ -346,6 +389,7 @@ fn main() -> Result<()> {
                 &mut estimator,
                 &mut detector,
                 &mut detection_cache,
+                &mut lifter,
                 &args,
                 index,
                 &mut json,

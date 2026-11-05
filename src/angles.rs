@@ -89,7 +89,7 @@ const JOINTS: &[Joint] = &[
     },
 ];
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct JointAngle {
     pub joint: &'static str,
     /// Unsigned interior angle in the image plane (0..180 degrees).
@@ -145,6 +145,15 @@ pub fn calculate(points: &[Keypoint], threshold: f32, size: Size) -> Vec<JointAn
 }
 
 pub fn draw(image: &mut Mat, points: &[Keypoint], angles: &[JointAngle]) -> Result<()> {
+    draw_labeled(image, points, angles, "2D")
+}
+
+pub fn draw_labeled(
+    image: &mut Mat,
+    points: &[Keypoint],
+    angles: &[JointAngle],
+    space: &str,
+) -> Result<()> {
     for joint in JOINTS {
         let Some(degrees) = angles
             .iter()
@@ -157,7 +166,7 @@ pub fn draw(image: &mut Mat, points: &[Keypoint], angles: &[JointAngle]) -> Resu
             continue;
         };
         // OpenCV's built-in font is ASCII; use 'deg' rather than a degree symbol.
-        let text = format!("{} {:.0} deg", joint.label, degrees);
+        let text = format!("{} {:.0} deg {}", joint.label, degrees, space);
         let mut baseline = 0;
         let scale = 0.42;
         let size = imgproc::get_text_size(
