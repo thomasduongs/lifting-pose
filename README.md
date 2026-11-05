@@ -31,6 +31,19 @@ and recent hand positions. Confirmed hand wrists replace the corresponding body
 wrist image positions, so finger skeletons connect to the arms. A body depth prior
 that strongly disagrees with the hand's location is excluded from wrist fitting.
 Unconfirmed coarse finger guesses are not drawn.
+Tracking crops extrapolate recent wrist motion and palm scale, add a margin, and
+retry with a wider crop after a miss. A high-confidence nearby hand only suppresses
+a recovery attempt when its wrist matches the expected wrist. Palm NMS permits
+more overlap, while landmark/handedness checks remove duplicate detections.
+New hands still require 0.65 presence confidence. A recently reliable hand may
+continue at 0.5 for up to 0.3 seconds, with a bound on wrist displacement.
+
+Brief losses are shown as **gray fingers marked `pred`**, using damped translation
+and scale of the last observed finger pose. They expire after 0.3 seconds; finger
+articulation is held, not extrapolated. Predictions are display-only: they never
+update body wrists, dimensions, IK observations, or recorded hand measurements.
+Optional JSON exports put them in a separate `predicted_hands` field. Replay still
+fills saved observation gaps independently from actual hand detections.
 
 Face and detailed foot tracking/overlays are disabled for now. Sparse head anchors
 remain internal to body fitting, and head position still follows the body model.

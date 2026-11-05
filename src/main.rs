@@ -205,6 +205,8 @@ struct PersonPose {
     twin: Option<twin::TwinPreview>,
     tracking: Option<tracking::TrackingResult>,
     hands: Vec<details::HandPose>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    predicted_hands: Vec<details::HandPose>,
     head: Option<details::HeadPose>,
 }
 
@@ -274,9 +276,13 @@ fn process(
         }
         let body_wrists = [keypoints[9], keypoints[10]];
         let hands = match hand_model.as_mut() {
-            Some(model) => model.infer(frame, &keypoints)?,
+            Some(model) => model.infer(frame, &keypoints, time_seconds)?,
             None => Vec::new(),
         };
+        let predicted_hands = hand_model
+            .as_ref()
+            .map(|model| model.predictions(time_seconds))
+            .unwrap_or_default();
         if estimator.is_mediapipe() {
             details::merge_hand_landmarks(&mut keypoints, &hands);
         }
@@ -356,6 +362,7 @@ fn process(
             twin,
             tracking,
             hands,
+            predicted_hands,
             head,
         });
     }
@@ -374,6 +381,11 @@ fn process(
         )?;
         writeln!(writer)?;
     }
+    if people.is_empty() {
+        if let Some(model) = hand_model.as_ref() {
+            details::draw_predicted_hands(frame, &model.predictions(time_seconds))?;
+        }
+    }
     for person in &people {
         if let Some(tracking) = &person.tracking {
             tracking::draw(frame, tracking, args.threshold)?;
@@ -381,6 +393,7 @@ fn process(
             pose::draw(frame, &person.keypoints, args.threshold)?;
         }
         details::draw_hands(frame, &person.hands)?;
+        details::draw_predicted_hands(frame, &person.predicted_hands)?;
         let b = person.bbox;
         let left = b.x.floor() as i32;
         let top = b.y.floor() as i32;

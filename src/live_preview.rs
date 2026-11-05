@@ -26,6 +26,7 @@ use std::{
 struct Estimate {
     captured: Instant,
     points: Vec<Keypoint>,
+    predicted_hands: Vec<(crate::details::HandPose, Instant)>,
 }
 pub struct LivePreview {
     input: Option<SyncSender<(u64, Mat, Instant)>>,
@@ -94,8 +95,19 @@ impl LivePreview {
                         if !full_body {
                             scope::mask_lower(&mut points);
                         }
+                        let mut predicted_hands = Vec::new();
                         if let Some(model) = &mut hands {
-                            let estimates = model.infer(&image, &points)?;
+                            let time = captured.duration_since(preview_start).as_secs_f64();
+                            let estimates = model.infer(&image, &points, time)?;
+                            predicted_hands = model
+                                .predictions(time)
+                                .into_iter()
+                                .map(|hand| {
+                                    let deadline =
+                                        model.prediction_deadline(&hand.side).unwrap_or(time);
+                                    (hand, preview_start + Duration::from_secs_f64(deadline))
+                                })
+                                .collect();
                             crate::details::merge_hand_landmarks(&mut points, &estimates);
                         } else if estimator.is_mediapipe() {
                             crate::details::merge_hand_landmarks(&mut points, &[]);
@@ -109,7 +121,11 @@ impl LivePreview {
                         for point in points.iter_mut().take(91).skip(23) {
                             point.score = 0.0;
                         }
-                        Ok(Estimate { captured, points })
+                        Ok(Estimate {
+                            captured,
+                            points,
+                            predicted_hands,
+                        })
                     })()
                     .map_err(|e| format!("{e:#}"));
                     let failed = estimate.is_err();
@@ -153,12 +169,20 @@ impl LivePreview {
         let status = if self.error.is_some() {
             "Pose preview unavailable; recording continues".into()
         } else if let Some(estimate) = &self.latest {
+            let predictions: Vec<_> = estimate
+                .predicted_hands
+                .iter()
+                .filter(|(_, deadline)| Instant::now() <= *deadline)
+                .map(|(hand, _)| hand.clone())
+                .collect();
             if estimate.captured.elapsed() > Duration::from_millis(750) {
                 "Pose preview catching up...".into()
             } else if estimate.points.is_empty() {
+                crate::details::draw_predicted_hands(frame, &predictions)?;
                 "Live 2D pose: looking for person".into()
             } else {
                 pose::draw(frame, &estimate.points, self.threshold)?;
+                crate::details::draw_predicted_hands(frame, &predictions)?;
                 let angles = angles::calculate_scoped(
                     &estimate.points,
                     self.threshold,

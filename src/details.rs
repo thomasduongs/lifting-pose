@@ -65,11 +65,59 @@ pub fn merge_hand_landmarks(points: &mut [Keypoint], hands: &[HandPose]) {
     }
 }
 
+struct HandTrack {
+    hand: HandPose,
+    previous: Option<(HandPose, f64)>,
+    time: f64,
+    strong_time: f64,
+}
+fn palm_span(hand: &HandPose) -> f32 {
+    let p = &hand.image_landmarks;
+    (p[5][0] - p[17][0])
+        .hypot(p[5][1] - p[17][1])
+        .max((p[0][0] - p[9][0]).hypot(p[0][1] - p[9][1]))
+        .max(8.0)
+}
+impl HandTrack {
+    fn prediction(&self, time: f64) -> Option<HandPose> {
+        let gap = time - self.time;
+        if !(0.0..=0.3).contains(&gap) {
+            return None;
+        }
+        let mut hand = self.hand.clone();
+        if let Some((previous, previous_time)) = &self.previous {
+            let dt = self.time - previous_time;
+            if dt > 1e-4 && dt < 0.5 {
+                // Damped rigid hand motion only: do not invent finger articulation.
+                let horizon = 0.10 * (1.0 - (-gap / 0.10).exp());
+                let factor = (horizon / dt) as f32;
+                let old = self.hand.image_landmarks[0];
+                let before = previous.image_landmarks[0];
+                let mut shift = [(old[0] - before[0]) * factor, (old[1] - before[1]) * factor];
+                let limit = palm_span(&self.hand) * 1.5;
+                let bound = (limit / shift[0].hypot(shift[1]).max(1e-6)).min(1.0);
+                shift[0] *= bound;
+                shift[1] *= bound;
+                let scale = ((palm_span(&self.hand) / palm_span(previous)).ln() * factor)
+                    .exp()
+                    .clamp(0.8, 1.3);
+                for p in &mut hand.image_landmarks {
+                    *p = [
+                        old[0] + shift[0] + (p[0] - old[0]) * scale,
+                        old[1] + shift[1] + (p[1] - old[1]) * scale,
+                    ];
+                }
+            }
+        }
+        hand.confidence *= (-gap / 0.15).exp() as f32;
+        Some(hand)
+    }
+}
 pub struct HandModel {
     net: dnn::Net,
     names: Vector<String>,
     palms: crate::palm::PalmDetector,
-    previous: BTreeMap<String, (HandPose, u8)>,
+    previous: BTreeMap<String, HandTrack>,
 }
 impl HandModel {
     pub fn new(path: &Path) -> Result<Self> {
@@ -90,44 +138,96 @@ impl HandModel {
             previous: BTreeMap::new(),
         })
     }
-    pub fn infer(&mut self, image: &Mat, points: &[Keypoint]) -> Result<Vec<HandPose>> {
+    /// Missing-hand predictions are deliberately returned separately from detections.
+    pub fn predictions(&self, time: f64) -> Vec<HandPose> {
+        self.previous
+            .values()
+            .filter(|track| time - track.time > 1e-6)
+            .filter_map(|track| track.prediction(time))
+            .collect()
+    }
+    pub fn prediction_deadline(&self, side: &str) -> Option<f64> {
+        self.previous.get(side).map(|track| track.time + 0.3)
+    }
+    pub fn infer(&mut self, image: &Mat, points: &[Keypoint], time: f64) -> Result<Vec<HandPose>> {
         if points.len() < 133 {
             return Ok(Vec::new());
         }
-        for (_, age) in self.previous.values_mut() {
-            *age = age.saturating_add(1);
-        }
-        self.previous.retain(|_, (_, age)| *age <= 3);
+        self.previous
+            .retain(|_, track| time >= track.time && time - track.time <= 0.5);
         let palms = self.palms.infer(image)?;
         let mut candidates = Vec::new();
         for palm in &palms {
             if let Some(crop) = HandCrop::from_palm(palm) {
-                if let Some(hand) = self.infer_crop(image, &crop)? {
-                    candidates.push(hand);
+                if let Some(hand) = self.infer_crop(image, &crop, 0.65)? {
+                    let duplicate = candidates
+                        .iter()
+                        .any(|(old, handedness): &(HandPose, f32)| {
+                            (old.image_landmarks[0][0] - hand.0.image_landmarks[0][0])
+                                .hypot(old.image_landmarks[0][1] - hand.0.image_landmarks[0][1])
+                                < palm_span(old).max(palm_span(&hand.0)) * 0.5
+                                && (*handedness - hand.1).abs() < 0.5
+                        });
+                    if !duplicate {
+                        candidates.push(hand);
+                    }
                 }
             }
         }
         // Reacquire even when coarse body fingers vanish. Previous hand bounds
         // are crop proposals only; every accepted hand gets fresh inference.
         for (side, base) in [("left", 91), ("right", 112)] {
-            let previous = self.previous.get(side).map(|(hand, _)| hand.clone());
+            let previous = self
+                .previous
+                .get(side)
+                .and_then(|track| track.prediction(time));
+            let threshold = if self
+                .previous
+                .get(side)
+                .is_some_and(|track| time - track.strong_time <= 0.3)
+            {
+                0.5
+            } else {
+                0.65
+            };
             let crop = previous
                 .as_ref()
                 .and_then(|hand| HandCrop::from_hand(hand))
                 .or_else(|| HandCrop::from_points(&points[base..base + 21]))
                 .or_else(|| HandCrop::from_sparse_points(&points[base..base + 21]));
-            if let Some(crop) = crop {
+            if let Some(mut crop) = crop {
+                if previous.is_some() {
+                    crop.side *= 1.15;
+                }
+                let wrist = previous
+                    .as_ref()
+                    .map(|hand| hand.image_landmarks[0])
+                    .unwrap_or(crop.center);
                 let already = candidates.iter().any(|(h, _)| {
-                    (h.image_landmarks[0][0] - crop.center[0])
-                        .hypot(h.image_landmarks[0][1] - crop.center[1])
-                        < crop.side * 0.65
+                    h.confidence >= 0.75
+                        && (h.image_landmarks[0][0] - wrist[0])
+                            .hypot(h.image_landmarks[0][1] - wrist[1])
+                            < crop.side * 0.15
                 });
                 if !already {
-                    if let Some(hand) = self.infer_crop(image, &crop)? {
-                        let duplicate = candidates.iter().any(|(h, _)| {
+                    let mut recovered = self.infer_crop(image, &crop, threshold)?;
+                    if recovered.is_none() && previous.is_some() {
+                        crop.side *= 1.4;
+                        recovered = self.infer_crop(image, &crop, threshold)?;
+                    }
+                    if let Some(hand) = recovered {
+                        if hand.0.confidence < 0.65
+                            && (hand.0.image_landmarks[0][0] - wrist[0])
+                                .hypot(hand.0.image_landmarks[0][1] - wrist[1])
+                                > crop.side * 0.3
+                        {
+                            continue;
+                        }
+                        let duplicate = candidates.iter().any(|(h, handedness)| {
                             (h.image_landmarks[0][0] - hand.0.image_landmarks[0][0])
                                 .hypot(h.image_landmarks[0][1] - hand.0.image_landmarks[0][1])
-                                < crop.side * 0.35
+                                < crop.side * 0.25
+                                && (*handedness - hand.1).abs() < 0.5
                         });
                         if !duplicate {
                             candidates.push(hand);
@@ -149,7 +249,8 @@ impl HandModel {
             } else {
                 (wrist[0] - width * if side == "left" { 0.7 } else { 0.3 }).abs() / scale
             };
-            let distance = if let Some((old, _)) = self.previous.get(side) {
+            let distance = if let Some(track) = self.previous.get(side) {
+                let old = &track.hand;
                 0.6 * body
                     + 0.4
                         * (wrist[0] - old.image_landmarks[0][0])
@@ -204,13 +305,32 @@ impl HandModel {
             if let Some(index) = index {
                 let mut hand = candidates[index].0.clone();
                 hand.side = side.into();
-                self.previous.insert(side.into(), (hand.clone(), 0));
+                let old = self.previous.remove(side);
+                let strong_time = if hand.confidence >= 0.65 {
+                    time
+                } else {
+                    old.as_ref().map(|track| track.strong_time).unwrap_or(time)
+                };
+                self.previous.insert(
+                    side.into(),
+                    HandTrack {
+                        hand: hand.clone(),
+                        time,
+                        strong_time,
+                        previous: old.map(|track| (track.hand, track.time)),
+                    },
+                );
                 hands.push(hand);
             }
         }
         Ok(hands)
     }
-    fn infer_crop(&mut self, image: &Mat, crop: &HandCrop) -> Result<Option<(HandPose, f32)>> {
+    fn infer_crop(
+        &mut self,
+        image: &Mat,
+        crop: &HandCrop,
+        threshold: f32,
+    ) -> Result<Option<(HandPose, f32)>> {
         let affine = Mat::from_slice_2d(&crop.affine())?;
         let mut warped = Mat::default();
         imgproc::warp_affine_def(image, &mut warped, &affine, Size::new(224, 224))?;
@@ -231,7 +351,7 @@ impl HandModel {
             Ok(outputs.get(index)?)
         };
         let confidence = output("Identity_1")?.data_typed::<f32>()?[0];
-        if !confidence.is_finite() || confidence < 0.65 {
+        if !confidence.is_finite() || confidence < threshold {
             return Ok(None);
         }
         let screen = output("Identity")?;
@@ -320,7 +440,7 @@ impl HandCrop {
                 name: "hand",
                 x: p[0],
                 y: p[1],
-                score: hand.confidence,
+                score: 1.0, // Crop guides carry no measurement confidence.
             })
             .collect();
         Self::from_points(&points)
@@ -541,8 +661,28 @@ pub fn head_pose(points: &[Keypoint], threshold: f32) -> Option<HeadPose> {
 }
 
 pub fn draw_hands(image: &mut Mat, hands: &[HandPose]) -> Result<()> {
+    draw_hands_colored(image, hands, Scalar::new(220.0, 90.0, 230.0, 0.0))
+}
+pub fn draw_predicted_hands(image: &mut Mat, hands: &[HandPose]) -> Result<()> {
+    draw_hands_colored(image, hands, Scalar::all(145.0))?;
     for hand in hands {
-        let color = Scalar::new(220.0, 90.0, 230.0, 0.0);
+        let p = hand.image_landmarks[0];
+        imgproc::put_text(
+            image,
+            "pred",
+            Point::new(p[0] as i32 + 5, p[1] as i32 + 12),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            0.35,
+            Scalar::all(170.0),
+            1,
+            imgproc::LINE_AA,
+            false,
+        )?;
+    }
+    Ok(())
+}
+fn draw_hands_colored(image: &mut Mat, hands: &[HandPose], color: Scalar) -> Result<()> {
+    for hand in hands {
         let point = |i: usize| {
             Point::new(
                 hand.image_landmarks[i][0] as i32,
@@ -567,6 +707,41 @@ pub fn draw_hands(image: &mut Mat, hands: &[HandPose]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn short_hand_predictions_decay_expire_and_preserve_finger_pose() {
+        let make = |x: f32| HandPose {
+            side: "left".into(),
+            confidence: 0.95,
+            image_landmarks: std::array::from_fn(|i| [x + i as f32, 100.0 + i as f32 * 0.5]),
+            world_landmarks: [[0.0; 3]; 21],
+        };
+        let track = HandTrack {
+            hand: make(110.0),
+            previous: Some((make(100.0), 0.0)),
+            time: 1.0 / 30.0,
+            strong_time: 1.0 / 30.0,
+        };
+        let prediction = track.prediction(0.1).unwrap();
+        assert!(prediction.image_landmarks[0][0] > 110.0);
+        assert!(prediction.confidence < track.hand.confidence);
+        for i in 1..21 {
+            let a = prediction.image_landmarks[i];
+            let b = prediction.image_landmarks[HAND_PARENT[i]];
+            let c = track.hand.image_landmarks[i];
+            let d = track.hand.image_landmarks[HAND_PARENT[i]];
+            assert!(
+                ((a[0] - b[0]).hypot(a[1] - b[1]) - (c[0] - d[0]).hypot(c[1] - d[1])).abs() < 1e-4
+            );
+        }
+        assert!(track.prediction(0.34).is_none());
+        assert!(track.prediction(-1.0).is_none());
+        let faded = track.prediction(0.32).unwrap();
+        assert!(faded.confidence < 0.2);
+        assert!(
+            HandCrop::from_hand(&faded).is_some(),
+            "Faded display confidence must not disable recovery crops"
+        );
+    }
     #[test]
     fn dedicated_hands_replace_coarse_guesses_and_connect_to_body_wrists() {
         let mut points = vec![

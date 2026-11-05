@@ -122,7 +122,7 @@ fn decode(boxes: &[f32], scores: &[f32], scale: f32, pad: [f32; 2]) -> Vec<Palm>
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut kept: Vec<Palm> = Vec::new();
     for palm in candidates {
-        if kept.iter().all(|p| iou(p.bbox, palm.bbox) < 0.3) {
+        if kept.iter().all(|p| iou(p.bbox, palm.bbox) < 0.45) {
             kept.push(palm);
             if kept.len() == 6 {
                 break;
