@@ -397,6 +397,11 @@ fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
 /// Block coordinate damped least-squares IK with analytic rotational Jacobians.
 /// Each step changes rotations only: dimensions remain fixed for the entire solve.
 fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -> Pose {
+    let depth_observation = frontal_arm_observation(dimensions, obs, previous);
+    solve_inverse(dimensions, &depth_observation, previous)
+}
+
+fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -> Pose {
     let mut initialized = initial_pose(dimensions, obs);
     align_upper_anchor(dimensions, &mut initialized, obs);
     let scale = if is_upper(obs) {
@@ -481,6 +486,213 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
         }
     }
     pose
+}
+
+/// Front-facing upper-body fallback: intersect a detected joint's camera ray
+/// with the fixed-length sphere around its parent. This recovers foreshortening
+/// that a nearly planar lifting prediction misses. The two depth branches are
+/// still ambiguous; use the learned direction, then history, then a forward reach.
+fn frontal_arm_observation(
+    dimensions: Dimensions,
+    obs: &Observation,
+    previous: Option<&Pose>,
+) -> Observation {
+    let mut result = obs.clone();
+    let shoulder = obs.points[11] - obs.points[14];
+    if !is_upper(obs) || shoulder.z.abs() > shoulder.norm() * 0.5 {
+        return result;
+    }
+    let mut torso = obs.clone();
+    for i in [12, 13, 15, 16] {
+        torso.scores[i] = 0.0;
+    }
+    let Some(translation) = camera_translation(&torso, &obs.points) else {
+        return result;
+    };
+    let previous_points = previous.map(|p| forward(dimensions, p).0);
+    for (parent, child, length) in [
+        (11, 12, dimensions.0[4]),
+        (12, 13, dimensions.0[5]),
+        (14, 15, dimensions.0[4]),
+        (15, 16, dimensions.0[5]),
+    ] {
+        if obs.scores[parent]
+            .min(obs.scores[child])
+            .min(obs.pixel_scores[parent])
+            .min(obs.pixel_scores[child])
+            < 0.6
+        {
+            continue;
+        }
+        let ray = V::new(
+            (obs.pixels[child][0] - obs.size.width as f64 / 2.0) / obs.focal,
+            (obs.pixels[child][1] - obs.size.height as f64 / 2.0) / obs.focal,
+            1.0,
+        );
+        let center = result.points[parent] + translation;
+        let a = ray.norm_squared();
+        let b = ray.dot(&center);
+        let discriminant = b * b - a * (center.norm_squared() - length * length);
+        if discriminant <= 0.0 {
+            continue;
+        }
+        let near = ray * ((b - discriminant.sqrt()) / a) - translation;
+        let far = ray * ((b + discriminant.sqrt()) / a) - translation;
+        let learned = obs.points[child].z - obs.points[parent].z;
+        let direction = if learned.abs() > length * 0.15 {
+            learned
+        } else if let Some(points) = &previous_points {
+            points[child].z - points[parent].z
+        } else {
+            -length
+        };
+        let target = if direction > length * 0.05 { far } else { near };
+        // Only supplement a weak depth estimate, and never infer beyond the camera.
+        if target.z + translation.z > 0.0
+            && (target.z - result.points[parent].z).abs() > learned.abs() * 1.25
+        {
+            result.points[child] = target;
+        }
+    }
+    result
+}
+
+// Palm segments avoid finger-flexion changes. Store their first reliable lengths
+// rather than allowing the hand network to resize the depth reference each frame.
+const PALM_PAIRS: [(usize, usize); 8] = [
+    (0, 5),
+    (0, 9),
+    (0, 13),
+    (0, 17),
+    (5, 9),
+    (9, 13),
+    (13, 17),
+    (5, 17),
+];
+struct HandDepthReference {
+    lengths: [f64; 8],
+    initial_scale: f64,
+    depth_per_shoulder: f64,
+    filtered_scale: f64,
+}
+fn palm_scale(hand: &HandPose, lengths: &[f64; 8]) -> Option<f64> {
+    let mut scales = Vec::new();
+    for (i, (a, b)) in PALM_PAIRS.into_iter().enumerate() {
+        let delta = V::from_column_slice(&hand.world_landmarks[b].map(f64::from))
+            - V::from_column_slice(&hand.world_landmarks[a].map(f64::from));
+        let foreshortening = delta.xy().norm() / delta.norm().max(1e-9);
+        let pixels = (f64::from(hand.image_landmarks[b][0] - hand.image_landmarks[a][0])).hypot(
+            f64::from(hand.image_landmarks[b][1] - hand.image_landmarks[a][1]),
+        );
+        if foreshortening >= 0.45 && pixels >= 5.0 && lengths[i] > 1e-5 {
+            let scale = pixels / (foreshortening * lengths[i]);
+            if scale.is_finite() {
+                scales.push(scale);
+            }
+        }
+    }
+    if scales.len() < 4 {
+        return None;
+    }
+    scales.sort_by(f64::total_cmp);
+    let median = scales[scales.len() / 2];
+    // Reject inconsistent segment scales (bad landmarks or an unreliable palm).
+    (scales
+        .iter()
+        .filter(|s| (**s / median - 1.0).abs() < 0.3)
+        .count()
+        >= 4)
+        .then_some(median)
+}
+fn inverse_with_hand_size(
+    dimensions: Dimensions,
+    obs: &Observation,
+    previous: Option<&Pose>,
+    references: &mut BTreeMap<String, HandDepthReference>,
+) -> (Pose, Observation) {
+    if obs.hands.is_empty() || !is_upper(obs) {
+        return (inverse(dimensions, obs, previous), obs.clone());
+    }
+    let mut corrected = frontal_arm_observation(dimensions, obs, previous);
+    let mut torso = obs.clone();
+    for i in [12, 13, 15, 16] {
+        torso.scores[i] = 0.0;
+    }
+    if let Some(camera) = camera_translation(&torso, &obs.points) {
+        for hand in &obs.hands {
+            let (shoulder, elbow, wrist) = match hand.side.as_str() {
+                "left" => (11, 12, 13),
+                "right" => (14, 15, 16),
+                _ => continue,
+            };
+            if hand.confidence < 0.8 || obs.scores[shoulder].min(obs.scores[wrist]) < 0.6 {
+                continue;
+            }
+            let lengths = PALM_PAIRS.map(|(a, b)| {
+                (V::from_column_slice(&hand.world_landmarks[b].map(f64::from))
+                    - V::from_column_slice(&hand.world_landmarks[a].map(f64::from)))
+                .norm()
+            });
+            let Some(scale) = palm_scale(
+                hand,
+                references
+                    .get(&hand.side)
+                    .map(|r| &r.lengths)
+                    .unwrap_or(&lengths),
+            ) else {
+                continue;
+            };
+            let depth = camera.z + obs.points[wrist].z;
+            if depth <= 0.0 {
+                continue;
+            }
+            let reference = references
+                .entry(hand.side.clone())
+                .or_insert(HandDepthReference {
+                    lengths,
+                    initial_scale: scale,
+                    filtered_scale: scale,
+                    depth_per_shoulder: depth / dimensions.0[1],
+                });
+            // Bound scale innovations and smooth multiplicative measurement noise.
+            let ratio = (scale / reference.filtered_scale).clamp(0.75, 1.33);
+            reference.filtered_scale *= ratio.powf(0.4);
+            let depth = reference.depth_per_shoulder * dimensions.0[1] * reference.initial_scale
+                / reference.filtered_scale;
+            let pixel = hand.image_landmarks[0];
+            let target = V::new(
+                (f64::from(pixel[0]) - obs.size.width as f64 / 2.0) * depth / obs.focal,
+                (f64::from(pixel[1]) - obs.size.height as f64 / 2.0) * depth / obs.focal,
+                depth,
+            ) - camera;
+            if !target.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let anchor = corrected.points[shoulder];
+            let delta = target - anchor;
+            let distance = delta.norm();
+            if distance < 1e-6 {
+                continue;
+            }
+            let upper = dimensions.0[4];
+            let lower = dimensions.0[5];
+            let reach = distance.clamp((upper - lower).abs() + 1e-5, (upper + lower) * 0.995);
+            let axis = delta / distance;
+            let along = (upper * upper - lower * lower + reach * reach) / (2.0 * reach);
+            let height = (upper * upper - along * along).max(0.0).sqrt();
+            let prior = corrected.points[elbow] - anchor;
+            let mut bend = prior - axis * prior.dot(&axis);
+            if bend.norm() < 1e-6 {
+                bend = V::y() - axis * axis.y;
+            }
+            if bend.norm() < 1e-6 {
+                bend = V::x() - axis * axis.x;
+            }
+            corrected.points[wrist] = anchor + axis * reach;
+            corrected.points[elbow] = anchor + axis * along + bend.normalize() * height;
+        }
+    }
+    (solve_inverse(dimensions, &corrected, previous), corrected)
 }
 
 #[derive(Serialize)]
@@ -638,6 +850,7 @@ impl TwinPreview {
 struct Subject {
     calibration: Calibration,
     hand_shapes: BTreeMap<String, Vec<Estimate>>,
+    hand_depth: BTreeMap<String, HandDepthReference>,
     observations: Vec<Observation>,
     previous: Option<Pose>,
 }
@@ -856,6 +1069,7 @@ impl TwinRecorder {
             self.subjects.push(Subject {
                 calibration: Calibration::new(&obs),
                 hand_shapes: BTreeMap::new(),
+                hand_depth: BTreeMap::new(),
                 observations: Vec::new(),
                 previous: None,
             });
@@ -869,9 +1083,14 @@ impl TwinRecorder {
             .calibration
             .update(&obs, f64::from(threshold.max(0.6)));
         let dimensions = subject.calibration.dimensions();
-        let solved = inverse(dimensions, &obs, subject.previous.as_ref());
-        subject.learn_hands(&obs, &solved);
-        let parameters = subject.frame(&obs, &solved);
+        let (solved, fitted_observation) = inverse_with_hand_size(
+            dimensions,
+            &obs,
+            subject.previous.as_ref(),
+            &mut subject.hand_depth,
+        );
+        subject.learn_hands(&fitted_observation, &solved);
+        let parameters = subject.frame(&fitted_observation, &solved);
         let fitted = forward(dimensions, &solved).0;
         let joints: Vec<_> = (0..N)
             .map(|i| Joint3d {
@@ -934,12 +1153,14 @@ impl TwinRecorder {
             writer.write_all(b",\"frames\":[")?;
             let dimensions = subject.calibration.dimensions();
             let mut previous = None;
+            let mut hand_depth = BTreeMap::new();
             for (index, obs) in subject.observations.iter().enumerate() {
                 if index > 0 {
                     writer.write_all(b",")?;
                 }
-                let pose = inverse(dimensions, obs, previous.as_ref());
-                let frame = subject.frame(obs, &pose);
+                let (pose, fitted_observation) =
+                    inverse_with_hand_size(dimensions, obs, previous.as_ref(), &mut hand_depth);
+                let frame = subject.frame(&fitted_observation, &pose);
                 ensure!(frame.fit_rmse.is_finite(), "Non-finite skeletal twin fit");
                 serde_json::to_writer(&mut writer, &frame)?;
                 previous = Some(pose);
@@ -984,6 +1205,97 @@ mod tests {
         p.local[11] = Q::from_euler_angles(0.3, 0.1, 0.8);
         p.local[12] = Q::from_euler_angles(0.7, 0.0, 0.2);
         p
+    }
+    #[test]
+    fn palm_size_drives_wrist_depth_and_ik_without_stretching_arms() {
+        let mut obs = observation(0, &Pose::default());
+        obs.scores[..8].fill(0.0);
+        let hand = |scale: f64, yaw: f64| {
+            let mut world = [[0.0_f32; 3]; 21];
+            for (i, p) in [
+                (5, [-0.035, -0.07, 0.0]),
+                (9, [-0.012, -0.09, 0.0]),
+                (13, [0.012, -0.085, 0.0]),
+                (17, [0.035, -0.06, 0.0]),
+            ] {
+                let p = Q::from_euler_angles(0.0, yaw, 0.0) * V::from(p);
+                world[i] = [p.x as f32, p.y as f32, p.z as f32];
+            }
+            HandPose {
+                side: "left".into(),
+                confidence: 0.95,
+                image_landmarks: world.map(|p| {
+                    [
+                        (520.0 + f64::from(p[0]) * scale) as f32,
+                        (90.0 + f64::from(p[1]) * scale) as f32,
+                    ]
+                }),
+                world_landmarks: world,
+            }
+        };
+        obs.hands = vec![hand(1000.0, 0.0)];
+        let mut references = BTreeMap::new();
+        let (initial, baseline) = inverse_with_hand_size(dimensions(), &obs, None, &mut references);
+        let mut previous = initial.clone();
+        obs.hands = vec![hand(1250.0, 0.0)];
+        let mut closer = baseline.clone();
+        for _ in 0..12 {
+            let (pose, target) =
+                inverse_with_hand_size(dimensions(), &obs, Some(&previous), &mut references);
+            previous = pose;
+            closer = target;
+        }
+        assert!(closer.points[13].z < baseline.points[13].z - 0.15);
+        let fitted = forward(dimensions(), &previous).0;
+        assert!(fitted[13].z < forward(dimensions(), &initial).0[13].z - 0.1);
+        assert!((fitted[13] - closer.points[13]).norm() < 0.03);
+        for (a, b, length) in [(11, 12, dimensions().0[4]), (12, 13, dimensions().0[5])] {
+            assert!(((fitted[b] - fitted[a]).norm() - length).abs() < 1e-10);
+        }
+        obs.hands = vec![hand(800.0, 0.0)];
+        let mut farther = closer.clone();
+        for _ in 0..12 {
+            let (pose, target) =
+                inverse_with_hand_size(dimensions(), &obs, Some(&previous), &mut references);
+            previous = pose;
+            farther = target;
+        }
+        assert!(farther.points[13].z > closer.points[13].z + 0.2);
+        // A rotated palm at the same distance keeps its orientation-corrected scale.
+        let fixed_lengths = references["left"].lengths;
+        let rotated = palm_scale(&hand(1000.0, 0.7), &fixed_lengths).unwrap();
+        assert!((rotated / 1000.0 - 1.0).abs() < 1e-5);
+        obs.hands[0].confidence = 0.2;
+        let (_, missing) = inverse_with_hand_size(dimensions(), &obs, None, &mut references);
+        assert_eq!(
+            missing.points,
+            frontal_arm_observation(dimensions(), &obs, None).points
+        );
+    }
+    #[test]
+    fn frontal_reach_recovers_wrist_depth_from_foreshortening() {
+        let mut obs = observation(0, &Pose::default());
+        obs.scores[..8].fill(0.0);
+        // The lifter predicts a flat arm, but the detected wrist lies much closer
+        // to the elbow in the image, as during a reach toward a frontal camera.
+        obs.pixels[13][0] = obs.pixels[12][0] + 40.0;
+        let corrected = frontal_arm_observation(dimensions(), &obs, None);
+        assert!(corrected.points[13].z < corrected.points[12].z - 0.15);
+        assert!(
+            ((corrected.points[13] - corrected.points[12]).norm() - dimensions().0[5]).abs() < 1e-9
+        );
+        let mut torso = obs.clone();
+        for i in [12, 13, 15, 16] {
+            torso.scores[i] = 0.0;
+        }
+        let camera = camera_translation(&torso, &obs.points).unwrap();
+        let wrist = corrected.points[13] + camera;
+        assert!((obs.focal * wrist.x / wrist.z + 320.0 - obs.pixels[13][0]).abs() < 1e-8);
+        assert!((obs.focal * wrist.y / wrist.z + 240.0 - obs.pixels[13][1]).abs() < 1e-8);
+        // An unreliable wrist must not invent depth from its pixel position.
+        obs.pixel_scores[13] = 0.0;
+        let missing = frontal_arm_observation(dimensions(), &obs, None);
+        assert_eq!(missing.points[13], obs.points[13]);
     }
     #[test]
     fn forward_kinematics_preserves_lengths_and_pelvis_width_under_rotations() {
@@ -1110,6 +1422,7 @@ mod tests {
         let mut subject = Subject {
             calibration: Calibration::new(&first),
             hand_shapes: BTreeMap::new(),
+            hand_depth: BTreeMap::new(),
             observations: Vec::new(),
             previous: None,
         };

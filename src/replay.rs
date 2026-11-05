@@ -308,13 +308,7 @@ fn bounds(
     let mut max = V::repeat(f64::NEG_INFINITY);
     for subject in subjects {
         for frame in &subject.frames {
-            for (i, p) in display_positions(record, subject, frame, follow, upper_body)?
-                .iter()
-                .enumerate()
-            {
-                if upper_body && !crate::scope::body_upper(i) {
-                    continue;
-                }
+            for p in &display_positions(record, subject, frame, follow, upper_body)? {
                 min = min.inf(p);
                 max = max.sup(p);
             }
@@ -338,7 +332,7 @@ impl Default for View {
     fn default() -> Self {
         Self {
             yaw: -0.55,
-            pitch: 0.12,
+            pitch: 0.22,
             zoom: 1.0,
             follow: true,
             names: false,
@@ -377,18 +371,40 @@ fn render(
         (x.is_finite() && y.is_finite() && x.abs() < 100000.0 && y.abs() < 100000.0)
             .then(|| Point::new(x.round() as i32, y.round() as i32))
     };
-    // A visual reference plane; no physical ground/contact estimate is implied.
-    for i in if view.upper_body { 0..0 } else { -5..6 } {
+    // Fixed visual floor under the recording, including the estimated lower-body
+    // scaffold. This is a spatial reference, not a measured ground/contact plane.
+    let floor_extent = scene.radius * 1.4;
+    let corners: Option<Vec<Point>> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .into_iter()
+        .map(|(x, z)| {
+            project(V::new(
+                scene.center.x + x * floor_extent,
+                scene.floor,
+                scene.center.z + z * floor_extent,
+            ))
+        })
+        .collect();
+    if let Some(corners) = corners {
+        let polygon = opencv::core::Vector::<Point>::from_iter(corners);
+        imgproc::fill_convex_poly(
+            &mut image,
+            &polygon,
+            Scalar::new(36.0, 31.0, 28.0, 0.0),
+            imgproc::LINE_AA,
+            0,
+        )?;
+    }
+    for i in -7..=7 {
         let offset = i as f64 * scene.radius / 5.0;
         for (a, b) in [
             (
                 V::new(
-                    scene.center.x - scene.radius,
+                    scene.center.x - floor_extent,
                     scene.floor,
                     scene.center.z + offset,
                 ),
                 V::new(
-                    scene.center.x + scene.radius,
+                    scene.center.x + floor_extent,
                     scene.floor,
                     scene.center.z + offset,
                 ),
@@ -397,17 +413,18 @@ fn render(
                 V::new(
                     scene.center.x + offset,
                     scene.floor,
-                    scene.center.z - scene.radius,
+                    scene.center.z - floor_extent,
                 ),
                 V::new(
                     scene.center.x + offset,
                     scene.floor,
-                    scene.center.z + scene.radius,
+                    scene.center.z + floor_extent,
                 ),
             ),
         ] {
             if let (Some(a), Some(b)) = (project(a), project(b)) {
-                imgproc::line(&mut image, a, b, Scalar::all(48.0), 1, imgproc::LINE_AA, 0)?;
+                let shade = if i == 0 { 100.0 } else { 62.0 };
+                imgproc::line(&mut image, a, b, Scalar::all(shade), 1, imgproc::LINE_AA, 0)?;
             }
         }
     }
@@ -421,13 +438,12 @@ fn render(
     if let Some((subject, pose)) = current {
         let positions = display_positions(record, subject, pose, view.follow, view.upper_body)?;
         for i in 1..N {
-            if view.upper_body
+            let unobserved = view.upper_body
                 && (!crate::scope::body_upper(i)
-                    || !crate::scope::body_upper(record.parents[i].unwrap()))
-            {
-                continue;
-            }
-            let color = if pose.prediction.body {
+                    || !crate::scope::body_upper(record.parents[i].unwrap()));
+            let color = if unobserved {
+                Scalar::all(100.0)
+            } else if pose.prediction.body {
                 Scalar::new(165.0, 165.0, 165.0, 0.0)
             } else if record.joint_names[i].starts_with("left_") {
                 Scalar::new(60.0, 180.0, 255.0, 0.0)
@@ -440,7 +456,15 @@ fn render(
                 project(positions[record.parents[i].unwrap()]),
                 project(positions[i]),
             ) {
-                imgproc::line(&mut image, a, b, color, 6, imgproc::LINE_AA, 0)?;
+                imgproc::line(
+                    &mut image,
+                    a,
+                    b,
+                    color,
+                    if unobserved { 2 } else { 6 },
+                    imgproc::LINE_AA,
+                    0,
+                )?;
             }
         }
         // Head position follows the 3D body; sparse face fitting supplies orientation when available.
@@ -504,16 +528,14 @@ fn render(
             }
         }
         for (i, p) in positions.iter().enumerate() {
-            if view.upper_body && !crate::scope::body_upper(i) {
-                continue;
-            }
+            let unobserved = view.upper_body && !crate::scope::body_upper(i);
             if let Some(p) = project(*p) {
                 imgproc::circle(
                     &mut image,
                     p,
                     6,
-                    Scalar::all(245.0),
-                    -1,
+                    Scalar::all(if unobserved { 100.0 } else { 245.0 }),
+                    if unobserved { 1 } else { -1 },
                     imgproc::LINE_AA,
                     0,
                 )?;
@@ -580,6 +602,16 @@ fn render(
             ),
             58,
             0.5,
+        ),
+        (
+            if view.upper_body {
+                "Gray lower body: unobserved estimate"
+            } else {
+                ""
+            }
+            .into(),
+            82,
+            0.45,
         ),
         (
             "Space play/pause | J/L step | A/D orbit | W/S tilt | +/- zoom".into(),
@@ -1416,19 +1448,17 @@ mod tests {
         }
     }
     #[test]
-    fn upper_body_camera_bounds_ignore_out_of_view_legs() {
-        let mut record = continuity_fixture();
+    fn upper_body_camera_bounds_include_unobserved_skeleton() {
+        let record = continuity_fixture();
         let selected: Vec<_> = record.subjects.iter().collect();
-        let before = bounds(&record, &selected, true, true).unwrap();
-        for subject in &mut record.subjects {
-            for i in 1..7 {
-                subject.person.rest_offsets[i] = [1000.0, 1000.0, 1000.0];
+        let bounds = bounds(&record, &selected, true, true).unwrap();
+        for subject in selected {
+            for frame in &subject.frames {
+                for p in display_positions(&record, subject, frame, true, true).unwrap() {
+                    assert!((p - bounds.center).norm() <= bounds.radius + 1e-9);
+                }
             }
         }
-        let selected: Vec<_> = record.subjects.iter().collect();
-        let after = bounds(&record, &selected, true, true).unwrap();
-        assert!((before.center - after.center).norm() < 1e-12);
-        assert!((before.radius - after.radius).abs() < 1e-12);
     }
     #[test]
     fn upper_body_follow_view_anchors_at_chest_without_distorting_arm_lengths() {

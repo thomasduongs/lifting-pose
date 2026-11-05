@@ -12,9 +12,13 @@ per-frame rotations, preserving bone lengths through forward kinematics.
 
 Tracking now focuses on the visible **head, neck, shoulders, arms, wrists, and
 hands**. Both shoulders must be reliable, but hips and legs are not required.
-The overlay and 3D replay omit the pelvis, hips, knees, ankles, and feet, and the
-viewer frames the upper body without a ground grid. Older recordings also replay
-in upper-body view by default.
+The 3D inset and replay still display the full skeleton. Unobserved lower-body
+joints appear in gray as an estimated scaffold; missing leg data is fine and
+never blocks upper-body tracking. The 2D overlay only draws available measurements.
+Older recordings also use upper-body tracking scope by default.
+Replay places a shaded perspective floor grid beneath the skeleton as a spatial
+reference. Its height follows the recording's lowest skeleton point; it is not a
+measured floor or a foot-contact estimate.
 
 The 3D lifting network still has a 17-joint interface. Neutral lower-body context
 is supplied internally with **zero confidence**; those slots are not treated as
@@ -31,6 +35,35 @@ ankle angles are omitted. Head and 3D hand tracking remain enabled. Add
 `--full-body` when recording/tracking to restore the full-body pipeline later.
 An upper-body-only save cannot turn its hidden slots into measured legs merely
 by passing `--full-body` to replay.
+
+For a camera facing your chest, upper-body fitting supplements weak elbow/wrist
+depth predictions using fixed arm lengths and perspective camera rays. It uses
+the detected foreshortening only for reliable joints and a roughly frontal torso.
+The learned depth direction selects the bend; previous rotations resolve weak
+predictions, with a reach toward the camera as the initial ambiguous default.
+This is a depth estimate, not a depth measurement. New recordings use this fit;
+existing saved rotations are unchanged. A calibrated focal length improves the
+camera model; the default focal length is approximate.
+
+With hand tracking enabled, changes in **apparent palm size** also constrain wrist
+depth: a larger palm implies a smaller camera distance, and vice versa. Each hand
+gets its own reference from its first reliable detection. The fit compares several
+palm segments, compensates for their estimated 3D orientation, and rejects weak
+or inconsistent measurements. It smooths scale changes and feeds the resulting
+wrist target through fixed-length shoulder/elbow IK, clamping targets to the arm's
+reach. The same calculation runs during live fitting and the final recording fit.
+Missing hand detections fall back to body-based fitting.
+
+Start with both palms clearly visible in a comfortable pose to establish the
+references. Initial absolute depth still comes from the body/camera estimate;
+relative hand-size changes improve reaching motion but do not provide metric depth.
+Palm turns, occlusion, and hand-model errors can still affect the estimate. This
+requires a new recording; replaying old saved rotations does not refit them.
+
+Using body axes **X forward/back, Y side-to-side, Z up/down**, a frontal camera
+maps forward toward the camera. The saved format retains camera coordinates for
+compatibility: body `(X, Y, Z) = (-camera_z, camera_x, -camera_y)` for aligned
+axes. Relabeling axes does not add depth information.
 
 ## Record and replay a 3D twin
 

@@ -408,12 +408,7 @@ pub fn draw(image: &mut Mat, pose: &Pose3d) -> Result<()> {
         .iter()
         .map(|j| (j.x + 0.5 * j.z, j.y - 0.3 * j.z))
         .collect();
-    let visible: Vec<_> = projected
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !upper || crate::scope::body_upper(*i))
-        .map(|(_, p)| *p)
-        .collect();
+    let visible: Vec<_> = projected.iter().copied().collect();
     let minx = visible.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
     let maxx = visible
         .iter()
@@ -437,16 +432,36 @@ pub fn draw(image: &mut Mat, pose: &Pose3d) -> Result<()> {
     };
     let color = Scalar::new(255.0, 210.0, 70.0, 0.0);
     for (a, b) in BONES {
-        if upper && (!crate::scope::body_upper(a) || !crate::scope::body_upper(b)) {
-            continue;
-        }
-        imgproc::line(image, pixel(a), pixel(b), color, 2, imgproc::LINE_AA, 0)?;
+        let unobserved = upper && (!crate::scope::body_upper(a) || !crate::scope::body_upper(b));
+        imgproc::line(
+            image,
+            pixel(a),
+            pixel(b),
+            if unobserved {
+                Scalar::all(100.0)
+            } else {
+                color
+            },
+            2,
+            imgproc::LINE_AA,
+            0,
+        )?;
     }
     for i in 0..JOINTS {
-        if upper && !crate::scope::body_upper(i) {
-            continue;
-        }
-        imgproc::circle(image, pixel(i), 3, color, -1, imgproc::LINE_AA, 0)?;
+        let unobserved = upper && !crate::scope::body_upper(i);
+        imgproc::circle(
+            image,
+            pixel(i),
+            3,
+            if unobserved {
+                Scalar::all(100.0)
+            } else {
+                color
+            },
+            if unobserved { 1 } else { -1 },
+            imgproc::LINE_AA,
+            0,
+        )?;
     }
     imgproc::put_text(
         image,
