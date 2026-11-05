@@ -4,6 +4,8 @@ mod detector;
 mod landmarks;
 mod motion3d;
 mod pose;
+mod tracking;
+mod twin;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -39,6 +41,15 @@ struct Args {
     /// Disable 3D lifting and use only 2D pose/angles.
     #[arg(long)]
     no_3d: bool,
+    /// Disable dimension-based landmark stabilization and automatic crop following.
+    #[arg(long)]
+    no_dimension_tracking: bool,
+    /// Final skeletal twin recording (one shared shape per subject segment).
+    #[arg(long, default_value = "output/twin.json")]
+    twin_output: PathBuf,
+    /// Calibrated camera focal length in pixels; otherwise frame width is assumed.
+    #[arg(long, value_parser = parse_positive)]
+    focal_length_px: Option<f64>,
     /// YOLOX-s detector (OpenCV Zoo raw 640x640 export).
     #[arg(long, default_value = "models/yolox-s.onnx")]
     detector_model: PathBuf,
@@ -77,6 +88,15 @@ struct Args {
     /// Stop after this many frames.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     max_frames: Option<u64>,
+}
+
+fn parse_positive(value: &str) -> std::result::Result<f64, String> {
+    let value: f64 = value.parse().map_err(|_| "Expected a positive number")?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err("Value must be finite and positive".into())
+    }
 }
 
 fn parse_probability(value: &str) -> std::result::Result<f32, String> {
@@ -132,6 +152,8 @@ struct PersonPose {
     keypoints: Vec<Keypoint>,
     angles: Vec<angles::JointAngle>,
     pose3d: Option<motion3d::Pose3d>,
+    twin: Option<twin::TwinPreview>,
+    tracking: Option<tracking::TrackingResult>,
 }
 
 #[derive(Serialize)]
@@ -150,6 +172,8 @@ fn process(
     detector: &mut Option<PersonDetector>,
     detection_cache: &mut DetectionCache,
     lifter: &mut Option<MotionLifter>,
+    twin_recorder: &mut twin::TwinRecorder,
+    dimension_tracker: &mut tracking::DimensionTracker,
     args: &Args,
     index: u64,
     json: &mut Option<BufWriter<File>>,
@@ -199,6 +223,33 @@ fn process(
             Some(lifter) => lifter.infer(&keypoints, bbox, frame.size()?, args.threshold)?,
             None => None,
         };
+        let twin = pose3d.as_ref().and_then(|pose| {
+            twin_recorder.observe(
+                index,
+                pose,
+                &keypoints,
+                bbox,
+                Size::new(frame.cols(), frame.rows()),
+                args.threshold,
+                args.focal_length_px,
+            )
+        });
+        let tracking = if args.no_dimension_tracking || args.no_3d {
+            None
+        } else {
+            Some(dimension_tracker.refine(
+                &keypoints,
+                twin.as_ref(),
+                bbox,
+                frame.size()?,
+                args.threshold,
+            ))
+        };
+        if detector.is_some() {
+            if let Some(next_crop) = tracking.as_ref().and_then(|t| t.next_crop) {
+                detection_cache.follow(next_crop);
+            }
+        }
         people.push(PersonPose {
             person_index,
             bbox,
@@ -206,6 +257,8 @@ fn process(
             keypoints,
             angles,
             pose3d,
+            twin,
+            tracking,
         });
     }
     let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -224,7 +277,11 @@ fn process(
         writeln!(writer)?;
     }
     for person in &people {
-        pose::draw(frame, &person.keypoints, args.threshold)?;
+        if let Some(tracking) = &person.tracking {
+            tracking::draw(frame, tracking, args.threshold)?;
+        } else {
+            pose::draw(frame, &person.keypoints, args.threshold)?;
+        }
         let b = person.bbox;
         let left = b.x.floor() as i32;
         let top = b.y.floor() as i32;
@@ -256,19 +313,33 @@ fn process(
         )?;
     }
     for person in &people {
-        if let Some(pose3d) = &person.pose3d {
+        let display_points = person
+            .tracking
+            .as_ref()
+            .map(|t| &t.keypoints)
+            .unwrap_or(&person.keypoints);
+        let display_angles = person
+            .tracking
+            .as_ref()
+            .map(|t| &t.angles)
+            .unwrap_or(&person.angles);
+        let display_pose = person
+            .twin
+            .as_ref()
+            .map(|twin| &twin.fitted_pose)
+            .or(person.pose3d.as_ref());
+        if let Some(pose3d) = display_pose {
             // The 3D model has no finger/toe landmarks; keep wrist/ankle labels in 2D.
-            let remaining: Vec<_> = person
-                .angles
+            let remaining: Vec<_> = display_angles
                 .iter()
                 .filter(|a| !pose3d.angles.iter().any(|b| b.joint == a.joint))
                 .cloned()
                 .collect();
-            angles::draw(frame, &person.keypoints, &remaining)?;
-            angles::draw_labeled(frame, &person.keypoints, &pose3d.angles, "3D")?;
+            angles::draw(frame, display_points, &remaining)?;
+            angles::draw_labeled(frame, display_points, &pose3d.angles, "3D")?;
             motion3d::draw(frame, pose3d)?;
         } else {
-            angles::draw(frame, &person.keypoints, &person.angles)?;
+            angles::draw(frame, display_points, display_angles)?;
         }
     }
     if index == 0 || index.is_multiple_of(30) {
@@ -283,7 +354,12 @@ fn process(
 fn main() -> Result<()> {
     let args = Args::parse();
     // Avoid truncating an input or model through an accidentally reused output path.
-    for destination in [&args.output, &args.json].into_iter().flatten() {
+    for destination in args
+        .output
+        .iter()
+        .chain(args.json.iter())
+        .chain(std::iter::once(&args.twin_output))
+    {
         for source in
             args.input
                 .iter()
@@ -306,6 +382,15 @@ fn main() -> Result<()> {
             "Image/video and JSON destinations must differ"
         );
     }
+    for other in args.output.iter().chain(args.json.iter()) {
+        ensure!(
+            other != &args.twin_output
+                && !(other.exists()
+                    && args.twin_output.exists()
+                    && other.canonicalize()? == args.twin_output.canonicalize()?),
+            "Twin, video/image, and JSON Lines output paths must differ"
+        );
+    }
     if let Some(input) = &args.input {
         ensure!(input.is_file(), "Input not found: {}", input.display());
     }
@@ -321,6 +406,8 @@ fn main() -> Result<()> {
     } else {
         Some(MotionLifter::new(&args.motion_model)?)
     };
+    let mut twin_recorder = twin::TwinRecorder::default();
+    let mut dimension_tracker = tracking::DimensionTracker::default();
     let mut json = args
         .json
         .as_ref()
@@ -347,6 +434,8 @@ fn main() -> Result<()> {
             &mut detector,
             &mut detection_cache,
             &mut lifter,
+            &mut twin_recorder,
+            &mut dimension_tracker,
             &args,
             0,
             &mut json,
@@ -390,6 +479,8 @@ fn main() -> Result<()> {
                 &mut detector,
                 &mut detection_cache,
                 &mut lifter,
+                &mut twin_recorder,
+                &mut dimension_tracker,
                 &args,
                 index,
                 &mut json,
@@ -439,6 +530,11 @@ fn main() -> Result<()> {
     }
     if !args.no_display {
         highgui::destroy_all_windows()?;
+    }
+    if !args.no_3d {
+        eprintln!("Finalizing skeletal twin with one fixed shape per subject segment...");
+        twin_recorder.save(&args.twin_output)?;
+        eprintln!("Saved skeletal twin: {}", args.twin_output.display());
     }
     Ok(())
 }

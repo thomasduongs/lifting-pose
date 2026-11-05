@@ -46,6 +46,27 @@ impl DetectionCache {
     pub fn detections(&self) -> &[Detection] {
         &self.detections
     }
+
+    /// Follow the selected person's fitted crop without resetting the detector schedule.
+    pub fn follow(&mut self, bbox: crate::pose::Bbox) {
+        let Some(size) = self.size else {
+            return;
+        };
+        if [bbox.x, bbox.y, bbox.width, bbox.height]
+            .iter()
+            .all(|v| v.is_finite())
+            && bbox.x >= 0.0
+            && bbox.y >= 0.0
+            && bbox.width > 0.0
+            && bbox.height > 0.0
+            && bbox.x + bbox.width <= size.width as f32
+            && bbox.y + bbox.height <= size.height as f32
+        {
+            if let Some(selected) = self.detections.first_mut() {
+                selected.bbox = bbox;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +141,33 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn crop_follow_moves_the_selected_person_without_delaying_detection() {
+        let mut cache = DetectionCache::new(15);
+        let size = Size::new(640, 480);
+        cache.update(0, size, || Ok(vec![person(10.0)])).unwrap();
+        let crop = crate::pose::Bbox {
+            x: 35.0,
+            y: 20.0,
+            width: 90.0,
+            height: 180.0,
+        };
+        cache.follow(crop);
+        assert_eq!(cache.detections()[0].bbox.x, 35.0);
+        assert_eq!(cache.detections()[0].score, 0.9);
+        assert!(
+            !cache
+                .update(14, size, || panic!("Detection ran early"))
+                .unwrap()
+        );
+        assert!(cache.update(15, size, || Ok(vec![person(100.0)])).unwrap());
+        assert_eq!(cache.detections()[0].bbox.x, 100.0);
+        cache.follow(crate::pose::Bbox {
+            x: f32::NAN,
+            ..crop
+        });
+        assert_eq!(cache.detections()[0].bbox.x, 100.0);
     }
 }

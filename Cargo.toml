@@ -12,3 +12,4 @@ clap = { version = "4", features = ["derive"] }
 opencv = { version = "0.101.1", default-features = false, features = ["clang-runtime", "dnn", "highgui", "imgcodecs", "imgproc", "videoio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }

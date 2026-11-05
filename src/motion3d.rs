@@ -16,7 +16,7 @@ use std::{collections::VecDeque, path::Path};
 const FRAMES: usize = 27;
 const JOINTS: usize = 17;
 type PoseInput = [[f32; 3]; JOINTS];
-const NAMES: [&str; JOINTS] = [
+pub(crate) const NAMES: [&str; JOINTS] = [
     "pelvis",
     "right_hip",
     "right_knee",
@@ -177,7 +177,7 @@ fn overlap(a: Bbox, b: Bbox) -> f32 {
 }
 
 /// Exact official demo coordinate mapping, including synthetic torso/head landmarks.
-fn coco_to_h36m(c: PoseInput) -> PoseInput {
+pub(crate) fn coco_to_h36m(c: PoseInput) -> PoseInput {
     let mut h = [[0.0; 3]; JOINTS];
     for (target, source) in [
         (9, 0),
@@ -304,7 +304,7 @@ impl MotionLifter {
     }
 }
 
-fn angles3d(joints: &[Joint3d], threshold: f32) -> Vec<JointAngle> {
+pub(crate) fn angles3d(joints: &[Joint3d], threshold: f32) -> Vec<JointAngle> {
     ANGLES
         .iter()
         .map(|&(joint, [a, b, c])| {
@@ -391,7 +391,11 @@ pub fn draw(image: &mut Mat, pose: &Pose3d) -> Result<()> {
     }
     imgproc::put_text(
         image,
-        &format!("3D body {}/27 (inferred)", pose.history_frames),
+        &if pose.model == "skeletal_twin_fk" {
+            "Twin (fixed bone fit)".to_owned()
+        } else {
+            format!("3D body {}/27 (inferred)", pose.history_frames)
+        },
         Point::new(origin.x + 7, origin.y + 18),
         imgproc::FONT_HERSHEY_SIMPLEX,
         0.4,

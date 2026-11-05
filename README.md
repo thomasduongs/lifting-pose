@@ -5,6 +5,9 @@ rendering with **RTMW-m WholeBody** (default) or **RTMPose-m**, followed by
 **MotionAGFormer-XS** temporal 3D body lifting. Runs on CPU; no Python inference environment or
 separate ONNX Runtime installation is required.
 
+A skeletal twin fits the 3D observations using shared body dimensions and
+per-frame rotations, preserving bone lengths through forward kinematics.
+
 Supports images, video files, and webcams, annotated image/video output, and
 JSON Lines keypoint export. The default model uses 192×256 input (width × height)
 and predicts 133 COCO-WholeBody landmarks:
@@ -30,18 +33,19 @@ occlusion. Detection confidence breaks ties between equally sized boxes.
 
 Use `--bbox x,y,width,height` to bypass detection with a fixed manual crop, or
 `--no-detection` to estimate one full-frame pose. Detection runs on the first
-frame and every **15 frames** thereafter by default. Between refreshes, the last
-selected bounding box is reused while pose estimation and angles update every
-frame. The selected person can change at a refresh when someone else has a larger
+frame and every **15 frames** thereafter by default. Between refreshes, the learned
+skeletal twin can move the selected crop gradually to follow the person while
+pose estimation and angles update every frame. Before calibration is ready, or
+when the fit is unreliable, the last crop is reused. The selected person can change at a refresh when someone else has a larger
 box. Empty detections are also cached until the next refresh; resolution changes
 force immediate detection. A moving person can leave the cached crop between
 refreshes, so use a smaller interval for fast motion. Persistent identity tracking and lifting form analysis are not implemented.
 
 Joint angles are displayed automatically beside the selected person's joints.
-With 3D lifting enabled, yellow shoulder, elbow, hip, and knee labels use inferred
+With 3D lifting enabled, yellow shoulder, elbow, hip, and knee labels use fitted
 **3D interior angles** and carry a `3D` suffix. Wrist and ankle angles retain a
 `2D` suffix because MotionAGFormer has no finger or toe outputs. A small inset
-shows an oblique view of the predicted 3D body skeleton. The existing JSON
+shows an oblique view of the fitted skeletal twin. The existing JSON
 `angles` field still contains all twelve 2D angles; 3D angles are separate.
 
 Use `--no-3d` to disable lifting and display only 2D labels. These are unsigned **2D interior
@@ -85,8 +89,9 @@ illustrative timings, not a controlled benchmark.
 are **root-relative camera-space model units**, not meters, world coordinates,
 or camera distance. Each joint's `input_score` comes from the 2D input; it is not
 a confidence produced by the 3D model. The model predicts body structure, not
-3D fingers/toes or measured spine curvature, and does not correct the exported
-2D keypoints or supply persistent person identities.
+3D fingers/toes or measured spine curvature. Raw `keypoints` and `pose3d` are
+preserved; dimension-guided image-space results are exported separately under
+`tracking`. The model does not supply persistent person identities.
 
 History resets when no person is selected, the torso becomes unreliable, frame
 resolution changes, or the selected box has little overlap with its predecessor.
@@ -95,6 +100,122 @@ tracker. Invalid limb inputs reuse the previous coordinate with zero input
 confidence (or the pelvis on the first frame). If the torso is unreliable,
 `pose3d` is null and the display falls back to 2D angles. Low-confidence input
 joints suppress affected 3D angle labels even when the model predicts XYZ.
+
+## Skeletal twin: person dimensions and frame pose
+
+The twin stores **one person model per subject segment** and a sequence of frame
+parameters. During capture, reliable new observations refine the shared person
+estimate. These revisions are provisional estimates of one body, not independent
+limb lengths per frame. On normal completion (including **q** / **Esc**), the app
+refits every saved observation against the **same final dimensions** and writes
+`output/twin.json`. Use `--twin-output path.json` to choose another destination.
+The destination is overwritten and its parent directories are created if needed.
+`--no-3d` disables both lifting and twin recording.
+
+| Stored data | Parameters |
+| --- | --- |
+| Person (shared across finalized frames) | Pelvis width, shoulder width, segment lengths, rest offsets, calibration revision and sample counts |
+| Frame | Root position/orientation, local joint quaternions, fitted 3D angles, fit error, and camera approximation metadata |
+
+Dimensions use the MotionAGFormer model's relative units. They are not calibrated
+centimeters or meters. Left/right upper legs, lower legs, upper arms, and forearms
+share lengths as a bilateral symmetry prior. The remaining shared segments are
+pelvis→spine, spine→thorax, thorax→nose, and nose→head; these are the model's joint
+definitions, not measurements of vertebrae or head surfaces.
+
+Calibration starts from the first valid 3D observation. Refinement begins once
+MotionAGFormer has 27 real history frames. Both endpoints must meet confidence
+`max(--threshold, 0.6)`. Each dimension starts with a confidence-weighted median
+over its first 31 accepted measurements, then uses a running estimate with
+bounded residuals to reduce outlier influence. Sample counts expose which
+dimensions have supporting observations; zero-count dimensions retain their
+initial estimate. More observations can reduce noise but do not remove systematic
+errors in the 3D model or guarantee true physical proportions.
+
+**Forward kinematics** uses the shared rest offsets and parent hierarchy:
+
+```text
+position[root] = root_position
+rotation[root] = root_orientation
+position[j] = position[parent[j]] + rotation[parent[j]] * rest_offset[j]
+rotation[j] = rotation[parent[j]] * local_rotation[j]
+```
+
+Rotations act on outgoing bones. The root local rotation is identity; its global
+orientation is stored separately. Quaternions use **[x, y, z, w]**, active
+rotations, and parent-local composition. The exported `joint_names`, `parents`,
+and shared `rest_offsets` are sufficient to reconstruct every frame without the
+neural model. The root has a null parent.
+
+**Inverse kinematics** fits rotations to confidence-weighted 3D observations
+with a robust loss, damped least-squares rotational updates, and bounded steps.
+It warms up from the previous solution when helpful and never changes dimensions
+inside a pose solve. `fit_rmse` reports the weighted observation residual in model
+units. Missing/low-confidence observations have zero weight. Joint-center fitting
+does not identify axial twist uniquely, and the current model uses unconstrained
+rotational joints; anatomical joint limits, meshes, skin, and contact constraints
+are not implemented.
+
+MotionAGFormer removes global root translation. The twin therefore approximates
+root position by fitting a **weak-perspective camera** to fitted 3D joints and
+their 2D image observations. It assumes square pixels and the image center as
+principal point. By default, focal length equals image width; provide a calibrated
+value with `--focal-length-px 900`. Each frame records whether focal length was
+assumed and whether the translation fit was valid. An invalid translation uses
+zero position with `root_translation_valid: false`. Positions are in an
+approximate camera coordinate system (x right, y down, z forward), not measured
+world trajectories. Camera movement is not separated from person movement, and
+supplying focal length alone does not establish metric scale.
+
+Streaming `--json` output keeps the raw `pose3d` observations and adds a `twin`
+preview containing the current provisional person parameters and fitted frame.
+Finalized `--twin-output` contains `subjects`, each with one `person` and many
+`frames`; person dimensions are never duplicated or adjusted inside those frames.
+Only frames with valid 3D observations are included. A large selected-box jump,
+resolution change, or a gap over 30 processed frames starts a separate subject
+segment to reduce mixing between people. This is a heuristic, not re-identification.
+3D observations are retained in memory until completion, and final refitting adds
+processing time proportional to the recording length. Abrupt termination before
+normal completion does not finalize the twin file.
+
+```sh
+cargo run --release -- --input lifting.mp4 --no-display \
+  --json output/preview.jsonl --twin-output output/twin.json
+```
+
+### Using dimensions during tracking
+
+Dimension-guided tracking is enabled by default. Once the twin has at least five
+accepted calibration frames (after the 27-frame 3D warmup), its fixed-length
+fitted skeleton is projected into the image using the estimated camera. Feedback
+is rejected if the 3D fit error is high or the projected torso disagrees with the
+observed torso. Three reliable torso landmarks are required for this check.
+
+- Strong 2D body observations are preserved. Uncertain visible body points can
+  blend toward the fitted skeleton with a bounded correction.
+- Missing body points can use model-inferred positions for up to five consecutive
+  frames with a trusted projection. They appear as gray hollow markers/links,
+  keep zero confidence, and do not produce measured 2D angles.
+- A padded crop follows the fitted body and reliable observed extremities.
+  Movement and resizing are gradual and clipped to the image. The detector still
+  runs every 15 frames and refreshes the selected person. Manual `--bbox` and
+  `--no-detection` crops remain fixed.
+
+The projection respects 3D segment lengths, rather than enforcing constant 2D
+pixel lengths, which would be incorrect for limbs pointing toward the camera.
+Fine hand/foot landmarks and facial points retain their raw positions; the
+correction stage currently targets the twelve shoulder-to-ankle body landmarks.
+
+Each person's streaming JSON includes `tracking.dimension_prior_active`,
+`tracking.keypoints`, derived `tracking.angles`, an `adjustments` list identifying
+blended/inferred joints, and an optional `next_crop`. Original raw `keypoints`,
+2D `angles`, and `pose3d` remain available. The correction stage does not feed
+its synthesized positions into MotionAGFormer or dimension calibration; those
+continue to use raw network observations. Image accuracy is not guaranteed by a
+consistent skeleton, particularly during occlusion or a poor depth estimate.
+
+Use `--no-dimension-tracking` to compare against raw 2D overlays and fixed cached
+crops while retaining the 3D twin. `--no-3d` also disables dimension feedback.
 
 ## Setup
 
@@ -267,6 +388,10 @@ cargo test
 - `src/angles.rs`: confidence-gated 2D joint angle calculations and 2D/3D degree labels.
 - `src/motion3d.rs`: COCO-to-H36M conversion, temporal buffering, native
   MotionAGFormer inference, root-relative XYZ, 3D angles, and skeleton inset.
+- `src/twin.rs`: shared dimension estimation, quaternion FK, robust rotation-only
+  IK, approximate camera root translation, and final fixed-shape recording export.
+- `src/tracking.rs`: learned-dimension landmark stabilization, bounded inferred
+  joint display, and crop feedback between detector refreshes.
 - `scripts/export_motionagformer.py`: one-time checkpoint-to-ONNX conversion and
   numerical parity validation; not used by the running app.
 - `src/detector.rs`: YOLOX-s RGB letterbox preprocessing, person-class decoding,
