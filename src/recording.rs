@@ -1,4 +1,4 @@
-//! Capture first; model inference runs afterward on the saved footage.
+//! Capture clean video with an optional live 2D preview; full 3D fitting follows.
 use anyhow::{Context, Result, ensure};
 use opencv::{
     core::{Mat, Point, Scalar, Size},
@@ -56,6 +56,7 @@ pub fn capture(
     no_display: bool,
     seconds: Option<f64>,
     max_frames: Option<u64>,
+    mut preview: Option<&mut dyn FnMut(&mut Mat, u64) -> Result<()>>,
 ) -> Result<Capture> {
     ensure!(
         !no_display || seconds.is_some() || max_frames.is_some() || input.is_some(),
@@ -141,6 +142,9 @@ pub fn capture(
         writer.as_mut().unwrap().write(&cropped)?;
         timestamps_seconds.push(elapsed);
         if !no_display {
+            if let Some(preview) = &mut preview {
+                preview(&mut frame, timestamps_seconds.len() as u64 - 1)?;
+            }
             // Labels belong only to the preview; source.mp4 contains unannotated video.
             imgproc::put_text(
                 &mut frame,

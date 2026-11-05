@@ -62,13 +62,17 @@ impl Crop {
 pub struct PoseEstimator {
     net: dnn::Net,
     output_names: Vector<String>,
+    mediapipe: bool,
+    direct_pose: Option<crate::motion3d::Pose3d>,
+    upper_body: bool,
+    mediapipe_center: Option<f32>,
 }
 
 impl PoseEstimator {
     pub fn new(path: &Path) -> Result<Self> {
         ensure!(
             path.is_file(),
-            "Model not found at {}. Place a supported RTMW-m or RTMPose-m ONNX model there or specify --model /path/to/model.onnx. See README.md for the model source.",
+            "Model not found at {}. Place a supported MediaPipe Pose, RTMW-m or RTMPose-m ONNX model there or specify --model /path/to/model.onnx. See README.md for the model source.",
             path.display()
         );
         let mut net = opencv::opencv_branch_5! {
@@ -81,11 +85,28 @@ impl PoseEstimator {
         opencv::not_opencv_branch_5! { net.set_preferable_target(dnn::DNN_TARGET_CPU)?; }
         let output_names = net.get_unconnected_out_layers_names()?;
         ensure!(
-            output_names.len() == 2,
-            "Expected two SimCC outputs, found {}. Use a documented RTMW-m or RTMPose-m export.",
+            matches!(output_names.len(), 2 | 5),
+            "Expected MediaPipe Pose (five outputs) or RTM SimCC (two outputs); found {}.",
             output_names.len()
         );
-        Ok(Self { net, output_names })
+        Ok(Self {
+            mediapipe: output_names.len() == 5,
+            net,
+            output_names,
+            direct_pose: None,
+            upper_body: true,
+            mediapipe_center: None,
+        })
+    }
+
+    pub fn is_mediapipe(&self) -> bool {
+        self.mediapipe
+    }
+    pub fn set_upper_body(&mut self, upper_body: bool) {
+        self.upper_body = upper_body;
+    }
+    pub fn take_pose3d(&mut self) -> Option<crate::motion3d::Pose3d> {
+        self.direct_pose.take()
     }
 
     pub fn infer(&mut self, image: &Mat, bbox: Bbox) -> Result<Vec<Keypoint>> {
@@ -94,6 +115,49 @@ impl PoseEstimator {
             bbox.width > 0.0 && bbox.height > 0.0,
             "Crop must have positive dimensions"
         );
+        self.direct_pose = None;
+        if self.mediapipe {
+            let mut roi = bbox;
+            let center = self
+                .mediapipe_center
+                .filter(|x| *x >= bbox.x && *x <= bbox.x + bbox.width);
+            if let Some(center) = center {
+                roi.x = center - bbox.width / 2.0;
+            }
+            let (mut points, mut pose) = crate::mediapipe::infer(
+                &mut self.net,
+                &self.output_names,
+                image,
+                roi,
+                self.upper_body,
+            )?;
+            let shoulder_center = |points: &[Keypoint]| {
+                (points[5].score.min(points[6].score) >= 0.6)
+                    .then_some((points[5].x + points[6].x) / 2.0)
+            };
+            // Bootstrap a torso-centered ROI when a raised arm makes the
+            // detector box asymmetric. Later frames reuse the measured center.
+            if self.upper_body && center.is_none() {
+                if let Some(center) = shoulder_center(&points) {
+                    if (center - (bbox.x + bbox.width / 2.0)).abs() > bbox.height * 0.15 {
+                        roi.x = center - bbox.width / 2.0;
+                        let refined = crate::mediapipe::infer(
+                            &mut self.net,
+                            &self.output_names,
+                            image,
+                            roi,
+                            self.upper_body,
+                        )?;
+                        if refined.1.is_some() {
+                            (points, pose) = refined;
+                        }
+                    }
+                }
+            }
+            self.mediapipe_center = shoulder_center(&points);
+            self.direct_pose = pose;
+            return Ok(points);
+        }
         let crop = Crop::new(bbox);
         let sx = f64::from(WIDTH) / f64::from(crop.width);
         let sy = f64::from(HEIGHT) / f64::from(crop.height);
@@ -223,7 +287,11 @@ pub fn draw(image: &mut Mat, points: &[Keypoint], threshold: f32) -> Result<()> 
             && p.y >= 0.0
             && p.y < image.rows() as f32
     };
-    let visibility: Vec<_> = points.iter().map(visible).collect();
+    let visibility: Vec<_> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| visible(p) && !matches!(i,0..=4 | 17..=90))
+        .collect();
     let point = |p: &Keypoint| Point::new(p.x.round() as i32, p.y.round() as i32);
     for &(a, b) in BONES {
         if a < points.len() && b < points.len() && visibility[a] && visibility[b] {
@@ -353,5 +421,37 @@ mod tests {
         let y = vec![0.0; BODY_KEYPOINTS * 512];
         assert!(decode(&x, &y, crop, WHOLEBODY_KEYPOINTS).is_err());
         assert!(decode(&x, &y, crop, 21).is_err());
+    }
+    #[test]
+    fn overlay_hides_face_and_feet_but_keeps_hand_landmarks() {
+        let mut points = vec![
+            Keypoint {
+                name: "test",
+                x: -1.0,
+                y: -1.0,
+                score: 0.0
+            };
+            133
+        ];
+        for i in [0, 1, 17, 23] {
+            points[i] = Keypoint {
+                name: "detail",
+                x: 20.0 + i as f32,
+                y: 20.0,
+                score: 1.0,
+            };
+        }
+        let mut image =
+            Mat::new_rows_cols_with_default(160, 160, core::CV_8UC3, Scalar::all(0.0)).unwrap();
+        draw(&mut image, &points, 0.3).unwrap();
+        assert!(image.data_bytes().unwrap().iter().all(|v| *v == 0));
+        points[91] = Keypoint {
+            name: "hand",
+            x: 100.0,
+            y: 100.0,
+            score: 1.0,
+        };
+        draw(&mut image, &points, 0.3).unwrap();
+        assert!(image.data_bytes().unwrap().iter().any(|v| *v != 0));
     }
 }

@@ -4,11 +4,15 @@ mod details;
 mod detection_cache;
 mod detector;
 mod landmarks;
+mod live_preview;
+mod mediapipe;
 mod motion3d;
+mod palm;
 mod pose;
 mod recording;
 mod replay;
 mod scope;
+mod smoothing;
 mod tracking;
 mod twin;
 
@@ -67,7 +71,10 @@ struct Args {
     hand_model: PathBuf,
     #[arg(long)]
     no_hands: bool,
-    #[arg(long, default_value = "models/rtmw-m.onnx")]
+    /// Opt in to sparse-face head orientation; head position is tracked without it.
+    #[arg(long)]
+    head_orientation: bool,
+    #[arg(long, default_value = "models/mediapipe-pose.onnx")]
     model: PathBuf,
     /// MotionAGFormer-XS H36M ONNX export for 3D body lifting.
     #[arg(long, default_value = "models/motionagformer-xs.onnx")]
@@ -222,6 +229,7 @@ fn process(
     dimension_tracker: &mut tracking::DimensionTracker,
     args: &Args,
     index: u64,
+    time_seconds: f64,
     json: &mut Option<BufWriter<File>>,
 ) -> Result<()> {
     let start = Instant::now();
@@ -260,26 +268,58 @@ fn process(
     let mut people = Vec::with_capacity(crops.len());
     for (person_index, (bbox, detection_score)) in crops.into_iter().enumerate() {
         let mut keypoints = estimator.infer(frame, bbox)?;
+        scope::mask_details(&mut keypoints);
         if !args.full_body {
             scope::mask_lower(&mut keypoints);
         }
+        let body_wrists = [keypoints[9], keypoints[10]];
         let hands = match hand_model.as_mut() {
             Some(model) => model.infer(frame, &keypoints)?,
             None => Vec::new(),
         };
-        let head = details::head_pose(&keypoints, args.threshold);
+        if estimator.is_mediapipe() {
+            details::merge_hand_landmarks(&mut keypoints, &hands);
+        }
+        let head = if args.head_orientation {
+            details::head_pose(&keypoints, args.threshold)
+        } else {
+            None
+        };
         let angles = if args.full_body {
             angles::calculate(&keypoints, args.threshold, frame.size()?)
         } else {
             angles::calculate_scoped(&keypoints, args.threshold, frame.size()?, true)
         };
-        let pose3d = match lifter.as_mut() {
-            Some(lifter) => lifter.infer(&keypoints, bbox, frame.size()?, args.threshold)?,
-            None => None,
+        let mut pose3d = if args.no_3d {
+            None
+        } else if estimator.is_mediapipe() {
+            estimator.take_pose3d()
+        } else {
+            match lifter.as_mut() {
+                Some(lifter) => lifter.infer(&keypoints, bbox, frame.size()?, args.threshold)?,
+                None => None,
+            }
         };
+        if estimator.is_mediapipe() {
+            if let Some(pose) = &mut pose3d {
+                let width =
+                    (keypoints[5].x - keypoints[6].x).hypot(keypoints[5].y - keypoints[6].y);
+                for hand in &hands {
+                    let side = if hand.side == "left" { 0 } else { 1 };
+                    let old = body_wrists[side];
+                    let wrist = hand.image_landmarks[0];
+                    if (old.x - wrist[0]).hypot(old.y - wrist[1]) > (width * 0.3).max(40.0) {
+                        // The hand detector has located the wrist elsewhere. Keep
+                        // its reliable 2D constraint without trusting stale body depth.
+                        pose.joints[if side == 0 { 13 } else { 16 }].input_score = 0.0;
+                    }
+                }
+            }
+        }
         let twin = pose3d.as_ref().and_then(|pose| {
             twin_recorder.observe(
                 index,
+                time_seconds,
                 pose,
                 &keypoints,
                 &hands,
@@ -290,7 +330,7 @@ fn process(
                 args.focal_length_px,
             )
         });
-        let tracking = if args.no_dimension_tracking || args.no_3d {
+        let tracking = if args.no_dimension_tracking || args.no_3d || estimator.is_mediapipe() {
             None
         } else {
             Some(dimension_tracker.refine(
@@ -445,6 +485,8 @@ fn main() -> Result<()> {
             },
         );
     }
+    let mut estimator = PoseEstimator::new(&args.model)?;
+    estimator.set_upper_body(!args.full_body);
     let session_workspace = if args.record.is_some() {
         Some(tempfile::tempdir()?)
     } else {
@@ -469,7 +511,9 @@ fn main() -> Result<()> {
             );
         }
         let directory = session_workspace.as_ref().unwrap().path();
-        for path in [&args.model, &args.motion_model] {
+        for path in std::iter::once(&args.model)
+            .chain((!estimator.is_mediapipe() && !args.no_3d).then_some(&args.motion_model))
+        {
             ensure!(
                 path.is_file(),
                 "Model not found: {}. Set up models before recording.",
@@ -482,6 +526,10 @@ fn main() -> Result<()> {
                 "Hand model missing: {}",
                 args.hand_model.display()
             );
+            ensure!(
+                args.hand_model.with_file_name("palmdet.onnx").is_file(),
+                "Palm model missing beside hand model: palmdet.onnx"
+            );
         }
         if !args.no_detection && args.bbox.is_none() {
             ensure!(
@@ -490,6 +538,33 @@ fn main() -> Result<()> {
                 args.detector_model.display()
             );
         }
+        let mut preview = if args.no_display {
+            None
+        } else {
+            Some(live_preview::LivePreview::new(
+                &args.model,
+                (!args.no_hands).then_some(args.hand_model.as_path()),
+                if args.no_detection || args.bbox.is_some() {
+                    None
+                } else {
+                    Some((
+                        args.detector_model.as_path(),
+                        args.detection_threshold,
+                        args.nms_threshold,
+                    ))
+                },
+                args.bbox,
+                args.detection_interval,
+                args.threshold,
+                args.full_body,
+            )?)
+        };
+        let mut draw_preview = |frame: &mut Mat, index: u64| -> Result<()> {
+            if let Some(preview) = &mut preview {
+                preview.draw(frame, index)?;
+            }
+            Ok(())
+        };
         let captured = recording::capture(
             directory,
             args.input.as_deref(),
@@ -497,6 +572,11 @@ fn main() -> Result<()> {
             args.no_display,
             args.record_seconds,
             args.max_frames,
+            if args.no_display {
+                None
+            } else {
+                Some(&mut draw_preview)
+            },
         )?;
         recording::export_trimmed(
             &captured,
@@ -563,14 +643,13 @@ fn main() -> Result<()> {
     if let Some(input) = &args.input {
         ensure!(input.is_file(), "Input not found: {}", input.display());
     }
-    let mut estimator = PoseEstimator::new(&args.model)?;
     let mut detector = if args.bbox.is_some() || args.no_detection {
         None
     } else {
         Some(PersonDetector::new(&args.detector_model)?)
     };
     let mut detection_cache = DetectionCache::new(args.detection_interval);
-    let mut lifter = if args.no_3d {
+    let mut lifter = if args.no_3d || estimator.is_mediapipe() {
         None
     } else {
         Some(MotionLifter::new(&args.motion_model)?)
@@ -620,6 +699,7 @@ fn main() -> Result<()> {
             &mut dimension_tracker,
             &args,
             0,
+            0.0,
             &mut json,
         )?;
         if let Some(path) = &args.output {
@@ -673,6 +753,11 @@ fn main() -> Result<()> {
                 &mut dimension_tracker,
                 &args,
                 index,
+                captured
+                    .as_ref()
+                    .and_then(|c| c.timestamps_seconds.get(index as usize))
+                    .copied()
+                    .unwrap_or(*timeline.last().unwrap()),
                 &mut json,
             )?;
             if let Some(path) = &args.output {

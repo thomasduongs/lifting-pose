@@ -14,3 +14,11 @@ pub fn mask_lower(points: &mut [crate::pose::Keypoint]) {
         }
     }
 }
+/// Keep sparse head anchors for the body model, but omit face/foot detail tracking.
+pub fn mask_details(points: &mut [crate::pose::Keypoint]) {
+    for point in points.iter_mut().take(91).skip(17) {
+        point.x = -1.0;
+        point.y = -1.0;
+        point.score = 0.0;
+    }
+}

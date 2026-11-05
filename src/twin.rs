@@ -6,7 +6,7 @@ use crate::{
     pose::{Bbox, Keypoint},
 };
 use anyhow::{Context, Result, ensure};
-use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
+use nalgebra::{Matrix2x3, Matrix3, Rotation3, UnitQuaternion, Vector2, Vector3};
 use opencv::core::Size;
 use serde::Serialize;
 use std::{
@@ -62,6 +62,7 @@ impl Dimensions {
 
 #[derive(Clone)]
 struct Pose {
+    time_seconds: f64,
     root: V,
     orientation: Q,
     local: [Q; N],
@@ -69,6 +70,7 @@ struct Pose {
 impl Default for Pose {
     fn default() -> Self {
         Self {
+            time_seconds: 0.0,
             root: V::zeros(),
             orientation: Q::identity(),
             local: [Q::identity(); N],
@@ -158,6 +160,7 @@ impl Estimate {
 
 struct Calibration {
     upper_body: bool,
+    direct_depth: bool,
     estimates: [Estimate; 10],
     revision: u64,
     frames: u64,
@@ -197,6 +200,7 @@ impl Calibration {
         });
         Self {
             upper_body,
+            direct_depth: obs.direct_depth,
             estimates,
             revision: 0,
             frames: 0,
@@ -204,7 +208,7 @@ impl Calibration {
     }
     fn update(&mut self, obs: &Observation, minimum: f64) {
         // MotionAGFormer startup repeats poses. Do not count those as calibration evidence.
-        if obs.history_frames < 27 {
+        if !obs.direct_depth && obs.history_frames < 27 {
             return;
         }
         let data = measurements(&obs.points, &obs.scores, minimum);
@@ -235,7 +239,11 @@ impl Calibration {
     fn parameters(&self) -> PersonParameters {
         let dimensions = self.dimensions();
         PersonParameters {
-            units: "motionagformer_model_units",
+            units: if self.direct_depth {
+                "mediapipe_estimated_meters"
+            } else {
+                "motionagformer_model_units"
+            },
             revision: self.revision,
             pelvis_width: (!self.upper_body).then_some(dimensions.0[0]),
             body_scope: if self.upper_body {
@@ -284,6 +292,8 @@ pub struct PersonParameters {
 #[derive(Clone)]
 struct Observation {
     frame: u64,
+    time_seconds: f64,
+    direct_depth: bool,
     points: [V; N],
     scores: [f64; N],
     pixels: [[f64; 2]; N],
@@ -296,8 +306,131 @@ struct Observation {
     head: Option<HeadPose>,
 }
 
+#[derive(Default)]
+struct HandSmoother {
+    world: [crate::smoothing::AdaptivePoint; 21],
+    pixels: [crate::smoothing::AdaptivePoint; 21],
+}
+#[derive(Default)]
+struct ObservationSmoother {
+    points: [crate::smoothing::AdaptivePoint; N],
+    pixels: [crate::smoothing::AdaptivePoint; N],
+    hands: BTreeMap<String, HandSmoother>,
+    head: crate::smoothing::AdaptiveRotation,
+}
+impl ObservationSmoother {
+    fn apply(&mut self, obs: &Observation) -> Observation {
+        let mut output = obs.clone();
+        if !obs.direct_depth {
+            return output;
+        }
+        let anchor = if is_upper(obs) {
+            obs.points[8]
+        } else {
+            obs.points[0]
+        };
+        let scale = (obs.points[11] - obs.points[14]).norm().max(0.1);
+        for i in 0..N {
+            if obs.scores[i] > 0.0 {
+                let speed = scale
+                    * if [12, 13, 15, 16].contains(&i) {
+                        20.0
+                    } else {
+                        10.0
+                    };
+                output.points[i] = anchor
+                    + self.points[i].filter(
+                        obs.points[i] - anchor,
+                        obs.time_seconds,
+                        scale,
+                        speed,
+                        1.5,
+                    );
+            }
+            if obs.pixel_scores[i] > 0.0 {
+                let p = self.pixels[i].filter(
+                    V::new(obs.pixels[i][0], obs.pixels[i][1], 0.0),
+                    obs.time_seconds,
+                    obs.size.width as f64,
+                    obs.size.width as f64 * 4.0,
+                    15.0,
+                );
+                output.pixels[i] = [p.x, p.y];
+            }
+        }
+        for hand in &mut output.hands {
+            let state = self.hands.entry(hand.side.clone()).or_default();
+            let world = hand.world_landmarks[0].map(f64::from);
+            let pixels = hand.image_landmarks[0].map(f64::from);
+            for i in 1..21 {
+                let relative = V::from(hand.world_landmarks[i].map(f64::from)) - V::from(world);
+                let p = V::from(world)
+                    + state.world[i].filter(relative, obs.time_seconds, 0.08, 2.0, 1.0);
+                hand.world_landmarks[i] = [p.x as f32, p.y as f32, p.z as f32];
+                let relative = V::new(
+                    hand.image_landmarks[i][0] as f64 - pixels[0],
+                    hand.image_landmarks[i][1] as f64 - pixels[1],
+                    0.0,
+                );
+                let p = state.pixels[i].filter(relative, obs.time_seconds, 80.0, 2000.0, 1.0);
+                hand.image_landmarks[i] = [(pixels[0] + p.x) as f32, (pixels[1] + p.y) as f32];
+            }
+        }
+        if let Some(head) = &mut output.head {
+            head.orientation_xyzw = quaternion(self.head.filter(
+                Q::new_normalize(nalgebra::Quaternion::new(
+                    head.orientation_xyzw[3],
+                    head.orientation_xyzw[0],
+                    head.orientation_xyzw[1],
+                    head.orientation_xyzw[2],
+                )),
+                obs.time_seconds,
+            ));
+        }
+        output
+    }
+}
+fn smoothed_observations(observations: &[Observation]) -> Vec<Observation> {
+    let mut state = ObservationSmoother::default();
+    let mut forward: Vec<_> = observations.iter().map(|o| state.apply(o)).collect();
+    let mut state = ObservationSmoother::default();
+    for (raw, output) in observations.iter().zip(&mut forward).rev() {
+        let backward = state.apply(raw);
+        if !raw.direct_depth {
+            continue;
+        }
+        for i in 0..N {
+            output.points[i] = (output.points[i] + backward.points[i]) / 2.0;
+            for axis in 0..2 {
+                output.pixels[i][axis] = (output.pixels[i][axis] + backward.pixels[i][axis]) / 2.0;
+            }
+        }
+        for hand in &mut output.hands {
+            if let Some(other) = backward.hands.iter().find(|h| h.side == hand.side) {
+                for i in 0..21 {
+                    for axis in 0..3 {
+                        hand.world_landmarks[i][axis] =
+                            (hand.world_landmarks[i][axis] + other.world_landmarks[i][axis]) / 2.0;
+                    }
+                    for axis in 0..2 {
+                        hand.image_landmarks[i][axis] =
+                            (hand.image_landmarks[i][axis] + other.image_landmarks[i][axis]) / 2.0;
+                    }
+                }
+            }
+        }
+        if let (Some(head), Some(other)) = (&mut output.head, &backward.head) {
+            let q =
+                |a: [f64; 4]| Q::new_normalize(nalgebra::Quaternion::new(a[3], a[0], a[1], a[2]));
+            head.orientation_xyzw =
+                quaternion(q(head.orientation_xyzw).slerp(&q(other.orientation_xyzw), 0.5));
+        }
+    }
+    forward
+}
+
 fn is_upper(obs: &Observation) -> bool {
-    obs.scores[..8].iter().all(|s| *s == 0.0) && obs.scores[8] > 0.0
+    obs.scores[..8].iter().all(|s| *s == 0.0)
 }
 fn align_upper_anchor(dimensions: Dimensions, pose: &mut Pose, obs: &Observation) {
     if is_upper(obs) {
@@ -335,6 +468,100 @@ fn cost(positions: &[V; N], obs: &Observation, delta: f64) -> f64 {
         })
         .sum()
 }
+
+fn project(p: V, camera: V, obs: &Observation) -> Option<(Vector2<f64>, Matrix2x3<f64>)> {
+    let p = p + camera;
+    if p.z <= 0.01 {
+        return None;
+    }
+    let f = obs.focal;
+    Some((
+        Vector2::new(
+            f * p.x / p.z + obs.size.width as f64 / 2.0,
+            f * p.y / p.z + obs.size.height as f64 / 2.0,
+        ),
+        Matrix2x3::new(
+            f / p.z,
+            0.0,
+            -f * p.x / (p.z * p.z),
+            0.0,
+            f / p.z,
+            -f * p.y / (p.z * p.z),
+        ),
+    ))
+}
+fn huber(r: f64, delta: f64) -> f64 {
+    if r <= delta {
+        r * r / 2.0
+    } else {
+        delta * (r - delta / 2.0)
+    }
+}
+struct FitContext<'a> {
+    obs: &'a Observation,
+    camera: Option<V>,
+    previous: Option<[V; N]>,
+    temporal: f64,
+    delta: f64,
+}
+impl FitContext<'_> {
+    fn temporal_weight(&self, i: usize) -> f64 {
+        if is_upper(self.obs) && i < 8 {
+            0.0
+        } else {
+            self.temporal * (1.0 + 2.0 * (1.0 - self.obs.scores[i]))
+        }
+    }
+    fn cost(&self, positions: &[V; N]) -> f64 {
+        let native = self.obs.direct_depth;
+        let mut result = cost(positions, self.obs, self.delta) * if native { 0.4 } else { 1.0 };
+        for i in 1..N {
+            if let Some(camera) = self.camera {
+                if let Some((pixel, _)) = project(positions[i], camera, self.obs) {
+                    let r = (pixel - Vector2::from(self.obs.pixels[i])).norm();
+                    result += 2.0
+                        * self.obs.pixel_scores[i].powi(2)
+                        * huber(r, 12.0)
+                        * (camera.z / self.obs.focal).powi(2);
+                } else if self.obs.pixel_scores[i] > 0.0 {
+                    return f64::INFINITY;
+                }
+            }
+            if let Some(previous) = &self.previous {
+                result +=
+                    self.temporal_weight(i) * (positions[i] - previous[i]).norm_squared() / 2.0;
+            }
+        }
+        result
+    }
+}
+
+/// Prevent a fitted elbow/knee from folding beyond a broad anatomical envelope.
+/// The bend plane remains free; this does not impose an uncalibrated hinge axis.
+fn limit_bends(pose: &mut Pose) {
+    for node in [2, 5, 12, 15] {
+        let axis = if node == 12 {
+            V::x()
+        } else if node == 15 {
+            -V::x()
+        } else {
+            V::y()
+        };
+        let direction = pose.local[node] * axis;
+        let angle = axis.dot(&direction).clamp(-1.0, 1.0).acos();
+        let max = 165.0_f64.to_radians();
+        if angle > max {
+            let mut normal = axis.cross(&direction);
+            if normal.norm() < 1e-8 {
+                normal = V::z();
+            }
+            let target = Q::from_scaled_axis(normal.normalize() * max) * axis;
+            if let Some(correction) = Q::rotation_between(&direction, &target) {
+                pose.local[node] = unit(correction * pose.local[node]);
+            }
+        }
+    }
+}
 fn array(v: V) -> [f64; 3] {
     [v.x, v.y, v.z]
 }
@@ -354,7 +581,7 @@ fn root_orientation(obs: &Observation) -> Q {
         obs.points[4] - obs.points[1]
     };
     let down = if is_upper(obs) {
-        obs.points[8] - obs.points[10]
+        V::y()
     } else {
         obs.points[0] - obs.points[8]
     };
@@ -375,6 +602,7 @@ fn root_orientation(obs: &Observation) -> Q {
 
 fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
     let mut pose = Pose {
+        time_seconds: obs.time_seconds,
         orientation: root_orientation(obs),
         ..Pose::default()
     };
@@ -382,7 +610,10 @@ fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
         if is_upper(obs) && node < 8 {
             continue;
         }
-        if let Some(child) = ((node + 1)..N).find(|&i| PARENT[i] == node && obs.scores[i] > 0.0) {
+        if let Some(child) = ((node + 1)..N)
+            .filter(|&i| node != 8 || i == 11)
+            .find(|&i| PARENT[i] == node && obs.scores[i] > 0.0)
+        {
             let (positions, world) = forward(dimensions, &pose);
             let from = positions[child] - positions[node];
             let to = obs.points[child] - obs.points[node];
@@ -397,11 +628,6 @@ fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
 /// Block coordinate damped least-squares IK with analytic rotational Jacobians.
 /// Each step changes rotations only: dimensions remain fixed for the entire solve.
 fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -> Pose {
-    let depth_observation = frontal_arm_observation(dimensions, obs, previous);
-    solve_inverse(dimensions, &depth_observation, previous)
-}
-
-fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -> Pose {
     let mut initialized = initial_pose(dimensions, obs);
     align_upper_anchor(dimensions, &mut initialized, obs);
     let scale = if is_upper(obs) {
@@ -411,13 +637,42 @@ fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Po
     };
     let delta = scale * 0.2;
     let mut previous = previous.cloned();
+    if previous.as_ref().is_some_and(|p| {
+        obs.time_seconds - p.time_seconds > 0.5 || obs.time_seconds < p.time_seconds
+    }) {
+        previous = None;
+    }
     if let Some(p) = previous.as_mut() {
         align_upper_anchor(dimensions, p, obs);
     }
+    let dt = previous
+        .as_ref()
+        .map(|p| obs.time_seconds - p.time_seconds)
+        .unwrap_or(1.0 / 30.0)
+        .max(1.0 / 240.0);
+    let context = FitContext {
+        obs,
+        delta,
+        camera: if obs.direct_depth {
+            fit_camera(obs, &obs.points)
+        } else {
+            None
+        },
+        previous: if obs.direct_depth {
+            previous.as_ref().map(|p| forward(dimensions, p).0)
+        } else {
+            None
+        },
+        temporal: if obs.direct_depth {
+            (0.10 * (1.0 / 30.0 / dt).powi(2)).min(0.6)
+        } else {
+            0.0
+        },
+    };
     let mut pose = match previous {
         Some(previous)
-            if cost(&forward(dimensions, &previous).0, obs, delta)
-                < cost(&forward(dimensions, &initialized).0, obs, delta) =>
+            if context.cost(&forward(dimensions, &previous).0)
+                < context.cost(&forward(dimensions, &initialized).0) =>
         {
             previous
         }
@@ -426,9 +681,12 @@ fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Po
     if !is_upper(obs) {
         pose.root = V::zeros();
     }
+    if obs.direct_depth {
+        limit_bends(&mut pose);
+    }
     let damping = scale.powi(2) * 0.002;
-    for _ in 0..8 {
-        let before = cost(&forward(dimensions, &pose).0, obs, delta);
+    for _ in 0..12 {
+        let before = context.cost(&forward(dimensions, &pose).0);
         for node in (0..N).rev() {
             if !(1..N).any(|i| descendant(i, node)) {
                 continue;
@@ -437,7 +695,7 @@ fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Po
             let mut a = Matrix3::identity() * damping;
             let mut b = V::zeros();
             for i in 1..N {
-                if !descendant(i, node) || obs.scores[i] <= 0.0 {
+                if !descendant(i, node) {
                     continue;
                 }
                 let pivot = if is_upper(obs) && (node == 0 || node == 7) {
@@ -447,12 +705,31 @@ fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Po
                 };
                 let arm = positions[i] - pivot;
                 let residual = obs.points[i] - positions[i];
-                let weight = obs.scores[i].powi(2) * robust_weight(residual.norm(), delta);
+                let weight = obs.scores[i].powi(2)
+                    * robust_weight(residual.norm(), delta)
+                    * if obs.direct_depth { 0.4 } else { 1.0 };
                 // delta_position = delta_rotation × arm.
                 let jacobian =
                     Matrix3::new(0.0, arm.z, -arm.y, -arm.z, 0.0, arm.x, arm.y, -arm.x, 0.0);
                 a += weight * jacobian.transpose() * jacobian;
                 b += weight * jacobian.transpose() * residual;
+                if let Some(camera) = context.camera {
+                    if let Some((pixel, derivative)) = project(positions[i], camera, obs) {
+                        let residual = Vector2::from(obs.pixels[i]) - pixel;
+                        let units = camera.z / obs.focal;
+                        let j = derivative * jacobian * units;
+                        let weight = 2.0
+                            * obs.pixel_scores[i].powi(2)
+                            * robust_weight(residual.norm(), 12.0);
+                        a += weight * j.transpose() * j;
+                        b += weight * j.transpose() * (residual * units);
+                    }
+                }
+                if let Some(previous) = &context.previous {
+                    let weight = context.temporal_weight(i);
+                    a += weight * jacobian.transpose() * jacobian;
+                    b += weight * jacobian.transpose() * (previous[i] - positions[i]);
+                }
             }
             let Some(mut step) = a.lu().solve(&b) else {
                 continue;
@@ -463,7 +740,7 @@ fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Po
             if !step.iter().all(|v| v.is_finite()) {
                 continue;
             }
-            let old_cost = cost(&positions, obs, delta);
+            let old_cost = context.cost(&positions);
             for factor in [1.0, 0.5, 0.25] {
                 let mut candidate = pose.clone();
                 let rotation = Q::from_scaled_axis(step * factor);
@@ -473,18 +750,22 @@ fn solve_inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Po
                     candidate.local[node] =
                         unit(world[PARENT[node]].inverse() * rotation * world[node]);
                 }
+                if obs.direct_depth {
+                    limit_bends(&mut candidate);
+                }
                 align_upper_anchor(dimensions, &mut candidate, obs);
-                if cost(&forward(dimensions, &candidate).0, obs, delta) < old_cost {
+                if context.cost(&forward(dimensions, &candidate).0) < old_cost {
                     pose = candidate;
                     break;
                 }
             }
         }
-        let after = cost(&forward(dimensions, &pose).0, obs, delta);
+        let after = context.cost(&forward(dimensions, &pose).0);
         if before - after < 1e-9 {
             break;
         }
     }
+    pose.time_seconds = obs.time_seconds;
     pose
 }
 
@@ -575,6 +856,96 @@ struct HandDepthReference {
     depth_per_shoulder: f64,
     filtered_scale: f64,
 }
+#[derive(Default)]
+struct DepthReferences {
+    hands: BTreeMap<String, HandDepthReference>,
+    body: BTreeMap<(usize, usize), BodyDepthReference>,
+}
+struct BodyDepthReference {
+    initial_scale: f64,
+    filtered_scale: f64,
+    depth_per_shoulder: f64,
+    last_frame: u64,
+}
+
+/// Size means landmark span, not a silhouette width. Compensate each span for
+/// its lifted orientation before interpreting its scale change as depth.
+fn body_size_observation(
+    dimensions: Dimensions,
+    obs: &Observation,
+    camera: V,
+    references: &mut BTreeMap<(usize, usize), BodyDepthReference>,
+    corrected: &mut Observation,
+) {
+    let offsets = dimensions.offsets();
+    let mut targets = [V::zeros(); N];
+    let mut weights = [0.0; N];
+    let pairs = (1..N)
+        .map(|i| (PARENT[i], i, offsets[i].norm()))
+        .chain([(11, 14, dimensions.0[1]), (1, 4, dimensions.0[0])]);
+    for (a, b, length) in pairs {
+        let confidence = obs.scores[a]
+            .min(obs.scores[b])
+            .min(obs.pixel_scores[a])
+            .min(obs.pixel_scores[b]);
+        let direction = obs.points[b] - obs.points[a];
+        let orientation = direction.xy().norm() / direction.norm().max(1e-9);
+        let pixels =
+            (obs.pixels[b][0] - obs.pixels[a][0]).hypot(obs.pixels[b][1] - obs.pixels[a][1]);
+        if confidence < 0.6 || orientation < 0.45 || pixels < 8.0 || length < 1e-5 {
+            continue;
+        }
+        let scale = pixels / (length * orientation);
+        let midpoint_depth = camera.z + (obs.points[a].z + obs.points[b].z) / 2.0;
+        if !scale.is_finite() || !midpoint_depth.is_finite() || midpoint_depth <= 0.0 {
+            continue;
+        }
+        let reference = references.entry((a, b)).or_insert(BodyDepthReference {
+            initial_scale: scale,
+            filtered_scale: scale,
+            depth_per_shoulder: midpoint_depth / dimensions.0[1],
+            last_frame: obs.frame,
+        });
+        // Skip smoothing across long detection gaps; never use an old size as a
+        // fresh observation. Bound innovations during continuous tracking.
+        if obs.frame.saturating_sub(reference.last_frame) > 30 {
+            reference.filtered_scale = scale;
+        } else {
+            reference.filtered_scale *= (scale / reference.filtered_scale)
+                .clamp(0.8, 1.25)
+                .powf(0.35);
+        }
+        reference.last_frame = obs.frame;
+        let depth = reference.depth_per_shoulder * dimensions.0[1] * reference.initial_scale
+            / reference.filtered_scale;
+        let model_midpoint = (obs.points[a].z + obs.points[b].z) / 2.0;
+        for node in [a, b] {
+            let z = depth + obs.points[node].z - model_midpoint;
+            // Reject implausible candidates instead of moving a joint through the camera.
+            if !z.is_finite() || z < camera.z * 0.1 || z > camera.z * 4.0 {
+                continue;
+            }
+            let target = V::new(
+                (obs.pixels[node][0] - obs.size.width as f64 / 2.0) * z / obs.focal,
+                (obs.pixels[node][1] - obs.size.height as f64 / 2.0) * z / obs.focal,
+                z,
+            ) - camera;
+            if !target.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let weight = confidence.powi(2) * orientation.powi(2);
+            targets[node] += target * weight;
+            weights[node] += weight;
+        }
+    }
+    for i in 0..N {
+        if weights[i] > 0.0 {
+            // Size is an additional cue: retain the lifting prior and let FK/IK
+            // reconcile overlapping segment estimates without stretching bones.
+            corrected.points[i] = corrected.points[i] * 0.4 + targets[i] / weights[i] * 0.6;
+        }
+    }
+}
 fn palm_scale(hand: &HandPose, lengths: &[f64; 8]) -> Option<f64> {
     let mut scales = Vec::new();
     for (i, (a, b)) in PALM_PAIRS.into_iter().enumerate() {
@@ -604,13 +975,13 @@ fn palm_scale(hand: &HandPose, lengths: &[f64; 8]) -> Option<f64> {
         >= 4)
         .then_some(median)
 }
-fn inverse_with_hand_size(
+fn inverse_with_size(
     dimensions: Dimensions,
     obs: &Observation,
     previous: Option<&Pose>,
-    references: &mut BTreeMap<String, HandDepthReference>,
+    references: &mut DepthReferences,
 ) -> (Pose, Observation) {
-    if obs.hands.is_empty() || !is_upper(obs) {
+    if obs.direct_depth {
         return (inverse(dimensions, obs, previous), obs.clone());
     }
     let mut corrected = frontal_arm_observation(dimensions, obs, previous);
@@ -619,6 +990,13 @@ fn inverse_with_hand_size(
         torso.scores[i] = 0.0;
     }
     if let Some(camera) = camera_translation(&torso, &obs.points) {
+        body_size_observation(
+            dimensions,
+            obs,
+            camera,
+            &mut references.body,
+            &mut corrected,
+        );
         for hand in &obs.hands {
             let (shoulder, elbow, wrist) = match hand.side.as_str() {
                 "left" => (11, 12, 13),
@@ -636,6 +1014,7 @@ fn inverse_with_hand_size(
             let Some(scale) = palm_scale(
                 hand,
                 references
+                    .hands
                     .get(&hand.side)
                     .map(|r| &r.lengths)
                     .unwrap_or(&lengths),
@@ -646,14 +1025,16 @@ fn inverse_with_hand_size(
             if depth <= 0.0 {
                 continue;
             }
-            let reference = references
-                .entry(hand.side.clone())
-                .or_insert(HandDepthReference {
-                    lengths,
-                    initial_scale: scale,
-                    filtered_scale: scale,
-                    depth_per_shoulder: depth / dimensions.0[1],
-                });
+            let reference =
+                references
+                    .hands
+                    .entry(hand.side.clone())
+                    .or_insert(HandDepthReference {
+                        lengths,
+                        initial_scale: scale,
+                        filtered_scale: scale,
+                        depth_per_shoulder: depth / dimensions.0[1],
+                    });
             // Bound scale innovations and smooth multiplicative measurement noise.
             let ratio = (scale / reference.filtered_scale).clamp(0.75, 1.33);
             reference.filtered_scale *= ratio.powf(0.4);
@@ -692,7 +1073,7 @@ fn inverse_with_hand_size(
             corrected.points[elbow] = anchor + axis * along + bend.normalize() * height;
         }
     }
-    (solve_inverse(dimensions, &corrected, previous), corrected)
+    (inverse(dimensions, &corrected, previous), corrected)
 }
 
 #[derive(Serialize)]
@@ -712,6 +1093,7 @@ pub struct FrameParameters {
     focal_length_assumed: bool,
     image_scale_px_per_unit: Option<f64>,
     fit_rmse: f64,
+    reprojection_rmse_px: Option<f64>,
     angles: Vec<crate::angles::JointAngle>,
     hands: Vec<HandFrame>,
     head: Option<HeadPose>,
@@ -757,6 +1139,71 @@ fn camera_translation(obs: &Observation, positions: &[V; N]) -> Option<V> {
     );
     root.iter().all(|v| v.is_finite()).then_some(root)
 }
+fn fit_camera(obs: &Observation, positions: &[V; N]) -> Option<V> {
+    let mut camera = camera_translation(obs, positions)?;
+    if !obs.direct_depth {
+        return Some(camera);
+    }
+    let weight = |i: usize| {
+        obs.pixel_scores[i].min(obs.scores[i]).powi(2)
+            * if [0, 7, 8, 9, 10, 11, 14].contains(&i) {
+                1.0
+            } else {
+                0.25
+            }
+    };
+    let error = |camera: V| -> f64 {
+        (0..N)
+            .filter(|&i| weight(i) > 0.0)
+            .map(|i| {
+                project(positions[i], camera, obs)
+                    .map(|(pixel, _)| {
+                        weight(i) * huber((pixel - Vector2::from(obs.pixels[i])).norm(), 12.0)
+                    })
+                    .unwrap_or(f64::INFINITY)
+            })
+            .sum()
+    };
+    for _ in 0..8 {
+        let mut a = Matrix3::identity() * 1e-4;
+        let mut b = V::zeros();
+        for i in 0..N {
+            if weight(i) <= 0.0 {
+                continue;
+            }
+            if let Some((pixel, j)) = project(positions[i], camera, obs) {
+                let residual = Vector2::from(obs.pixels[i]) - pixel;
+                let w = weight(i) * robust_weight(residual.norm(), 12.0);
+                a += w * j.transpose() * j;
+                b += w * j.transpose() * residual;
+            }
+        }
+        let Some(mut step) = a.lu().solve(&b) else {
+            break;
+        };
+        if !step.iter().all(|v| v.is_finite()) {
+            break;
+        }
+        let max_step = camera.z * 0.2;
+        if step.norm() > max_step {
+            step *= max_step / step.norm();
+        }
+        let before = error(camera);
+        let mut accepted = false;
+        for scale in [1.0, 0.5, 0.25] {
+            let candidate = camera + step * scale;
+            if candidate.z > 0.05 && error(candidate) < before {
+                camera = candidate;
+                accepted = true;
+                break;
+            }
+        }
+        if !accepted || step.norm() < 1e-6 {
+            break;
+        }
+    }
+    Some(camera)
+}
 fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> FrameParameters {
     let positions = forward(dimensions, pose).0;
     let fitted_joints: Vec<_> = (0..N)
@@ -774,7 +1221,19 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
         .sum::<f64>()
         / sum.max(1e-9))
     .sqrt();
-    let translation = camera_translation(obs, &positions);
+    let translation = fit_camera(obs, &positions);
+    let reprojection_rmse_px = translation.and_then(|camera| {
+        let mut sum = 0.0;
+        let mut weights = 0.0;
+        for i in 0..N {
+            if let Some((pixel, _)) = project(positions[i], camera, obs) {
+                let weight = obs.pixel_scores[i].min(obs.scores[i]).powi(2);
+                sum += weight * (pixel - Vector2::from(obs.pixels[i])).norm_squared();
+                weights += weight;
+            }
+        }
+        (weights > 0.0).then_some((sum / weights.max(1e-9)).sqrt())
+    });
     FrameParameters {
         frame: obs.frame,
         root_position: array(translation.map(|t| t + pose.root).unwrap_or(V::zeros())),
@@ -786,11 +1245,16 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
             })
             .collect(),
         root_translation_valid: translation.is_some(),
-        root_translation_model: "weak_perspective_approximation",
+        root_translation_model: if obs.direct_depth {
+            "perspective_translation_fit"
+        } else {
+            "weak_perspective_approximation"
+        },
         focal_length_px: obs.focal,
         focal_length_assumed: obs.assumed_focal,
         image_scale_px_per_unit: translation.map(|t| obs.focal / t.z),
         fit_rmse,
+        reprojection_rmse_px,
         angles: motion3d::angles3d(&fitted_joints, 0.0),
         hands: Vec::new(),
         head: obs.head.clone(),
@@ -831,6 +1295,11 @@ impl TwinPreview {
         }
         let projection = std::array::from_fn(|i| {
             let p = &self.fitted_pose.joints[i];
+            let scale = if self.frame.root_translation_model == "perspective_translation_fit" {
+                self.frame.focal_length_px / (f64::from(p.z) + root[2]).max(0.01)
+            } else {
+                scale
+            };
             [
                 ((f64::from(p.x) + root[0]) * scale + f64::from(size.width) / 2.0) as f32,
                 ((f64::from(p.y) + root[1]) * scale + f64::from(size.height) / 2.0) as f32,
@@ -850,11 +1319,16 @@ impl TwinPreview {
 struct Subject {
     calibration: Calibration,
     hand_shapes: BTreeMap<String, Vec<Estimate>>,
-    hand_depth: BTreeMap<String, HandDepthReference>,
+    depth_references: DepthReferences,
+    smoother: ObservationSmoother,
     observations: Vec<Observation>,
     previous: Option<Pose>,
 }
-fn registered_vectors(hand: &HandPose, frame: &FrameParameters) -> Option<[V; 21]> {
+fn registered_vectors(
+    hand: &HandPose,
+    frame: &FrameParameters,
+    wrist_depth: f64,
+) -> Option<[V; 21]> {
     if !frame.root_translation_valid || frame.root_position[2] <= 0.0 {
         return None;
     }
@@ -873,11 +1347,17 @@ fn registered_vectors(hand: &HandPose, frame: &FrameParameters) -> Option<[V; 21
             + p.y * f64::from(hand.image_landmarks[i][1] - hand.image_landmarks[0][1]);
         denominator += p.x * p.x + p.y * p.y;
     }
-    let scale = numerator
-        / denominator.max(1e-12)
-        / frame
+    let pixels_per_unit = if frame.root_translation_model == "perspective_translation_fit" {
+        if wrist_depth <= 0.01 {
+            return None;
+        }
+        frame.focal_length_px / wrist_depth
+    } else {
+        frame
             .image_scale_px_per_unit
-            .unwrap_or(frame.focal_length_px / frame.root_position[2]);
+            .unwrap_or(frame.focal_length_px / frame.root_position[2])
+    };
+    let scale = numerator / denominator.max(1e-12) / pixels_per_unit;
     if !scale.is_finite() || !(0.001..100.0).contains(&scale) {
         return None;
     }
@@ -911,8 +1391,14 @@ impl Subject {
     }
     fn learn_hands(&mut self, obs: &Observation, pose: &Pose) {
         let frame = frame_parameters(self.calibration.dimensions(), obs, pose);
+        let body = forward(self.calibration.dimensions(), pose).0;
         for hand in &obs.hands {
-            let Some(points) = registered_vectors(hand, &frame) else {
+            let Some(points) = registered_vectors(
+                hand,
+                &frame,
+                frame.root_position[2] + body[if hand.side == "left" { 13 } else { 16 }].z
+                    - pose.root.z,
+            ) else {
                 continue;
             };
             let lengths = self
@@ -929,7 +1415,7 @@ impl Subject {
                         })
                         .collect()
                 });
-            if obs.history_frames >= 27 && hand.confidence >= 0.8 {
+            if (obs.direct_depth || obs.history_frames >= 27) && hand.confidence >= 0.8 {
                 for i in 1..21 {
                     lengths[i].add(
                         (points[i] - points[HAND_PARENT[i]]).norm(),
@@ -941,11 +1427,17 @@ impl Subject {
     }
     fn frame(&self, obs: &Observation, pose: &Pose) -> FrameParameters {
         let mut frame = frame_parameters(self.calibration.dimensions(), obs, pose);
+        let body = forward(self.calibration.dimensions(), pose).0;
         for hand in &obs.hands {
             if !self.hand_shapes.contains_key(&hand.side) {
                 continue;
             }
-            let Some(points) = registered_vectors(hand, &frame) else {
+            let Some(points) = registered_vectors(
+                hand,
+                &frame,
+                frame.root_position[2] + body[if hand.side == "left" { 13 } else { 16 }].z
+                    - pose.root.z,
+            ) else {
                 continue;
             };
             let rotations = (0..21)
@@ -1000,6 +1492,7 @@ impl TwinRecorder {
     pub fn observe(
         &mut self,
         frame: u64,
+        time_seconds: f64,
         pose: &Pose3d,
         points: &[Keypoint],
         hands: &[HandPose],
@@ -1013,9 +1506,15 @@ impl TwinRecorder {
             return None;
         }
         let coco = std::array::from_fn(|i| [points[i].x, points[i].y, points[i].score]);
-        let screen = motion3d::coco_to_h36m(coco);
+        let screen = if pose.model == "MediaPipe-Pose" {
+            crate::mediapipe::skeleton_pixels(points)
+        } else {
+            motion3d::coco_to_h36m(coco)
+        };
         let obs = Observation {
             frame,
+            time_seconds,
+            direct_depth: pose.model == "MediaPipe-Pose",
             points: std::array::from_fn(|i| {
                 V::new(
                     pose.joints[i].x as f64,
@@ -1069,7 +1568,8 @@ impl TwinRecorder {
             self.subjects.push(Subject {
                 calibration: Calibration::new(&obs),
                 hand_shapes: BTreeMap::new(),
-                hand_depth: BTreeMap::new(),
+                depth_references: DepthReferences::default(),
+                smoother: ObservationSmoother::default(),
                 observations: Vec::new(),
                 previous: None,
             });
@@ -1079,15 +1579,16 @@ impl TwinRecorder {
         self.last_size = Some(size);
         let subject_segment = self.subjects.len() - 1;
         let subject = self.subjects.last_mut().unwrap();
+        let smoothed = subject.smoother.apply(&obs);
         subject
             .calibration
-            .update(&obs, f64::from(threshold.max(0.6)));
+            .update(&smoothed, f64::from(threshold.max(0.6)));
         let dimensions = subject.calibration.dimensions();
-        let (solved, fitted_observation) = inverse_with_hand_size(
+        let (solved, fitted_observation) = inverse_with_size(
             dimensions,
-            &obs,
+            &smoothed,
             subject.previous.as_ref(),
-            &mut subject.hand_depth,
+            &mut subject.depth_references,
         );
         subject.learn_hands(&fitted_observation, &solved);
         let parameters = subject.frame(&fitted_observation, &solved);
@@ -1153,13 +1654,14 @@ impl TwinRecorder {
             writer.write_all(b",\"frames\":[")?;
             let dimensions = subject.calibration.dimensions();
             let mut previous = None;
-            let mut hand_depth = BTreeMap::new();
-            for (index, obs) in subject.observations.iter().enumerate() {
+            let mut depth_references = DepthReferences::default();
+            let observations = smoothed_observations(&subject.observations);
+            for (index, obs) in observations.iter().enumerate() {
                 if index > 0 {
                     writer.write_all(b",")?;
                 }
                 let (pose, fitted_observation) =
-                    inverse_with_hand_size(dimensions, obs, previous.as_ref(), &mut hand_depth);
+                    inverse_with_size(dimensions, obs, previous.as_ref(), &mut depth_references);
                 let frame = subject.frame(&fitted_observation, &pose);
                 ensure!(frame.fit_rmse.is_finite(), "Non-finite skeletal twin fit");
                 serde_json::to_writer(&mut writer, &frame)?;
@@ -1183,6 +1685,8 @@ mod tests {
         let positions = forward(dimensions(), pose).0;
         Observation {
             frame,
+            time_seconds: frame as f64 / 30.0,
+            direct_depth: false,
             points: positions,
             scores: [0.9; N],
             pixels: positions.map(|p| [320.0 + p.x * 500.0, 240.0 + p.y * 500.0]),
@@ -1205,6 +1709,191 @@ mod tests {
         p.local[11] = Q::from_euler_angles(0.3, 0.1, 0.8);
         p.local[12] = Q::from_euler_angles(0.7, 0.0, 0.2);
         p
+    }
+    #[test]
+    fn perspective_camera_and_projection_jacobian_match_known_geometry() {
+        let mut obs = observation(0, &pose());
+        obs.direct_depth = true;
+        let camera = V::new(0.12, -0.08, 2.4);
+        for i in 0..N {
+            obs.pixels[i] = project(obs.points[i], camera, &obs).unwrap().0.into();
+        }
+        let recovered = fit_camera(&obs, &obs.points).unwrap();
+        assert!((recovered - camera).norm() < 1e-5);
+        let context = FitContext {
+            obs: &obs,
+            camera: Some(camera),
+            previous: None,
+            temporal: 0.0,
+            delta: 0.05,
+        };
+        let mut invalid = obs.points;
+        invalid[13].z = -camera.z;
+        assert!(!context.cost(&invalid).is_finite());
+        let p = obs.points[13];
+        let (_, j) = project(p, camera, &obs).unwrap();
+        for axis in 0..3 {
+            let mut offset = V::zeros();
+            offset[axis] = 1e-6;
+            let finite = (project(p + offset, camera, &obs).unwrap().0
+                - project(p - offset, camera, &obs).unwrap().0)
+                / 2e-6;
+            assert!((finite - j.column(axis)).norm() < 1e-5);
+        }
+    }
+    #[test]
+    fn image_alignment_corrects_a_bad_depth_prediction_without_resizing_limbs() {
+        let mut obs = observation(0, &pose());
+        let camera = V::new(0.12, -0.08, 2.4);
+        for i in 0..N {
+            obs.pixels[i] = project(obs.points[i], camera, &obs).unwrap().0.into();
+        }
+        obs.points[13].z += 0.2;
+        let old = inverse(dimensions(), &obs, None);
+        let error = |p: &Pose, obs: &Observation| {
+            let positions = forward(dimensions(), p).0;
+            (1..N)
+                .map(|i| {
+                    (project(positions[i], camera, &obs).unwrap().0 - Vector2::from(obs.pixels[i]))
+                        .norm_squared()
+                })
+                .sum::<f64>()
+        };
+        let before = error(&old, &obs);
+        obs.direct_depth = true;
+        let fitted = inverse(dimensions(), &obs, None);
+        let after = error(&fitted, &obs);
+        assert!(
+            after < before * 0.65,
+            "reprojection: before {before}, after {after}"
+        );
+        let points = forward(dimensions(), &fitted).0;
+        for i in 1..N {
+            assert!(
+                ((points[i] - points[PARENT[i]]).norm() - dimensions().offsets()[i].norm()).abs()
+                    < 1e-10
+            );
+        }
+    }
+    #[test]
+    fn upper_body_root_ignores_head_bobbing_and_bends_stay_bounded() {
+        let mut obs = observation(0, &pose());
+        obs.scores[..8].fill(0.0);
+        let before = root_orientation(&obs);
+        obs.points[10] += V::new(0.3, 0.0, 0.3);
+        assert!((before.inverse() * root_orientation(&obs)).angle() < 1e-10);
+        let mut folded = Pose::default();
+        folded.local[12] = Q::from_euler_angles(0.0, 0.0, 175.0_f64.to_radians());
+        limit_bends(&mut folded);
+        let bend = V::x()
+            .dot(&(folded.local[12] * V::x()))
+            .clamp(-1.0, 1.0)
+            .acos();
+        assert!((bend - 165.0_f64.to_radians()).abs() < 1e-8);
+    }
+    #[test]
+    fn occluded_chest_does_not_switch_upper_body_fit_to_hidden_legs() {
+        let mut obs = observation(0, &pose());
+        obs.scores[..8].fill(0.0);
+        obs.scores[8] = 0.0;
+        obs.scores[11] = 0.0;
+        assert!(is_upper(&obs));
+        let person = Calibration::new(&obs).parameters();
+        assert_eq!(person.body_scope, "upper_body");
+        assert!(person.pelvis_width.is_none());
+    }
+    #[test]
+    fn native_depth_bypasses_size_overrides_and_calibrates_without_temporal_warmup() {
+        let mut obs = observation(0, &pose());
+        obs.direct_depth = true;
+        obs.history_frames = 1;
+        let mut references = DepthReferences::default();
+        let (_, fitted) = inverse_with_size(dimensions(), &obs, None, &mut references);
+        assert_eq!(fitted.points, obs.points);
+        assert!(references.body.is_empty() && references.hands.is_empty());
+        let mut calibration = Calibration::new(&obs);
+        calibration.update(&obs, 0.6);
+        assert_eq!(calibration.frames, 1);
+        assert_eq!(calibration.parameters().units, "mediapipe_estimated_meters");
+    }
+    #[test]
+    fn body_size_depth_covers_head_torso_arms_and_visible_legs() {
+        let mut obs = observation(0, &Pose::default());
+        let camera = camera_translation(&obs, &obs.points).unwrap();
+        let mut references = BTreeMap::new();
+        let mut baseline = obs.clone();
+        body_size_observation(dimensions(), &obs, camera, &mut references, &mut baseline);
+        assert_eq!(references.len(), 18);
+        for pixel in &mut obs.pixels {
+            pixel[0] = 320.0 + (pixel[0] - 320.0) * 1.25;
+            pixel[1] = 240.0 + (pixel[1] - 240.0) * 1.25;
+        }
+        let mut closer = obs.clone();
+        for frame in 1..16 {
+            obs.frame = frame;
+            closer = obs.clone();
+            body_size_observation(dimensions(), &obs, camera, &mut references, &mut closer);
+        }
+        for i in 0..N {
+            assert!(
+                closer.points[i].z < baseline.points[i].z - 0.1,
+                "Missing size cue for joint {i}"
+            );
+        }
+        // Shrinking spans reverse the cue for every observed joint.
+        for pixel in &mut obs.pixels {
+            pixel[0] = 320.0 + (pixel[0] - 320.0) * 0.6;
+            pixel[1] = 240.0 + (pixel[1] - 240.0) * 0.6;
+        }
+        let mut farther = obs.clone();
+        for frame in 16..32 {
+            obs.frame = frame;
+            farther = obs.clone();
+            body_size_observation(dimensions(), &obs, camera, &mut references, &mut farther);
+        }
+        for i in 0..N {
+            assert!(farther.points[i].z > closer.points[i].z + 0.2);
+        }
+        let fit = inverse(dimensions(), &closer, None);
+        let points = forward(dimensions(), &fit).0;
+        for i in 1..N {
+            assert!(
+                ((points[i] - points[PARENT[i]]).norm() - dimensions().offsets()[i].norm()).abs()
+                    < 1e-9
+            );
+        }
+    }
+    #[test]
+    fn body_size_skips_hidden_parts_and_compensates_rotation() {
+        let mut obs = observation(0, &Pose::default());
+        obs.scores[..8].fill(0.0);
+        let camera = camera_translation(&obs, &obs.points).unwrap();
+        let mut references = BTreeMap::new();
+        let mut baseline = obs.clone();
+        body_size_observation(dimensions(), &obs, camera, &mut references, &mut baseline);
+        assert!(references.keys().all(|(a, b)| *a >= 8 && *b >= 8));
+        // Rotate one forearm: the projected span shrinks but its corrected scale
+        // and inferred depth remain unchanged.
+        let old_scale = references[&(12, 13)].filtered_scale;
+        let delta = Q::from_euler_angles(0.0, 0.7, 0.0) * (obs.points[13] - obs.points[12]);
+        let center = (obs.points[12] + obs.points[13]) / 2.0;
+        obs.points[12] = center - delta / 2.0;
+        obs.points[13] = center + delta / 2.0;
+        for i in [12, 13] {
+            obs.pixels[i] = [
+                320.0 + obs.points[i].x * 500.0,
+                240.0 + obs.points[i].y * 500.0,
+            ];
+        }
+        obs.frame = 1;
+        let mut turned = obs.clone();
+        body_size_observation(dimensions(), &obs, camera, &mut references, &mut turned);
+        assert!((references[&(12, 13)].filtered_scale / old_scale - 1.0).abs() < 1e-9);
+        assert!((turned.points[13].z - obs.points[13].z).abs() < 1e-9);
+        obs.pixel_scores.fill(0.0);
+        let mut missing = obs.clone();
+        body_size_observation(dimensions(), &obs, camera, &mut references, &mut missing);
+        assert_eq!(missing.points, obs.points);
     }
     #[test]
     fn palm_size_drives_wrist_depth_and_ik_without_stretching_arms() {
@@ -1234,14 +1923,14 @@ mod tests {
             }
         };
         obs.hands = vec![hand(1000.0, 0.0)];
-        let mut references = BTreeMap::new();
-        let (initial, baseline) = inverse_with_hand_size(dimensions(), &obs, None, &mut references);
+        let mut references = DepthReferences::default();
+        let (initial, baseline) = inverse_with_size(dimensions(), &obs, None, &mut references);
         let mut previous = initial.clone();
         obs.hands = vec![hand(1250.0, 0.0)];
         let mut closer = baseline.clone();
         for _ in 0..12 {
             let (pose, target) =
-                inverse_with_hand_size(dimensions(), &obs, Some(&previous), &mut references);
+                inverse_with_size(dimensions(), &obs, Some(&previous), &mut references);
             previous = pose;
             closer = target;
         }
@@ -1256,21 +1945,20 @@ mod tests {
         let mut farther = closer.clone();
         for _ in 0..12 {
             let (pose, target) =
-                inverse_with_hand_size(dimensions(), &obs, Some(&previous), &mut references);
+                inverse_with_size(dimensions(), &obs, Some(&previous), &mut references);
             previous = pose;
             farther = target;
         }
         assert!(farther.points[13].z > closer.points[13].z + 0.2);
         // A rotated palm at the same distance keeps its orientation-corrected scale.
-        let fixed_lengths = references["left"].lengths;
+        let fixed_lengths = references.hands["left"].lengths;
         let rotated = palm_scale(&hand(1000.0, 0.7), &fixed_lengths).unwrap();
         assert!((rotated / 1000.0 - 1.0).abs() < 1e-5);
         obs.hands[0].confidence = 0.2;
-        let (_, missing) = inverse_with_hand_size(dimensions(), &obs, None, &mut references);
-        assert_eq!(
-            missing.points,
-            frontal_arm_observation(dimensions(), &obs, None).points
-        );
+        let (_, missing) = inverse_with_size(dimensions(), &obs, None, &mut references);
+        obs.hands.clear();
+        let (_, body_only) = inverse_with_size(dimensions(), &obs, None, &mut references);
+        assert_eq!(missing.points, body_only.points);
     }
     #[test]
     fn frontal_reach_recovers_wrist_depth_from_foreshortening() {
@@ -1422,7 +2110,8 @@ mod tests {
         let mut subject = Subject {
             calibration: Calibration::new(&first),
             hand_shapes: BTreeMap::new(),
-            hand_depth: BTreeMap::new(),
+            depth_references: DepthReferences::default(),
+            smoother: ObservationSmoother::default(),
             observations: Vec::new(),
             previous: None,
         };

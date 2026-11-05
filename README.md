@@ -1,12 +1,70 @@
 # lifting-pose
 
 Rust CLI using **OpenCV** for capture, preprocessing, ONNX inference, and skeleton
-rendering with **RTMW-m WholeBody** (default) or **RTMPose-m**, followed by
-**MotionAGFormer-XS** temporal 3D body lifting. Runs on CPU; no Python inference environment or
+rendering with **MediaPipe Pose** (default), using its native 3D body landmarks.
+**RTMW-m / RTMPose-m + MotionAGFormer-XS** remain available as an alternative. Runs on CPU; no Python inference environment or
 separate ONNX Runtime installation is required.
 
 A skeletal twin fits the 3D observations using shared body dimensions and
 per-frame rotations, preserving bone lengths through forward kinematics.
+
+
+## MediaPipe Pose (default)
+
+The default body model is OpenCV Zoo's [MediaPipe Pose ONNX export](https://github.com/opencv/opencv_zoo/tree/main/models/pose_estimation_mediapipe).
+It takes 256×256 RGB input and estimates 33 image and hip-relative 3D landmarks.
+YOLOX still selects the closest person every 15 frames; the pose model runs every
+processed frame. Upper-body mode adds virtual crop space below the image for the
+unseen legs and recenters the crop on measured shoulders. Unseen legs keep zero
+confidence and are excluded from fitting/calibration.
+
+The native 3D landmarks go directly into fixed-length twin IK. MediaPipe mode
+bypasses MotionAGFormer, the experimental size/depth overrides described below,
+and projected-landmark stabilization. This lets you compare the new body model
+without those corrections overriding its predictions. Body units are inferred
+meters, not camera-calibrated measurements. Live recording uses the new model too.
+Hands use a dedicated MediaPipe palm detector, followed by an oriented crop and
+21-point hand inference. Palm detection runs independently of the body's coarse
+finger guesses. Previous hand bounds and body anchors provide recovery crops;
+every accepted hand is inferred afresh. Left/right assignment uses body wrists
+and recent hand positions. Confirmed hand wrists replace the corresponding body
+wrist image positions, so finger skeletons connect to the arms. A body depth prior
+that strongly disagrees with the hand's location is excluded from wrist fitting.
+Unconfirmed coarse finger guesses are not drawn.
+
+Face and detailed foot tracking/overlays are disabled for now. Sparse head anchors
+remain internal to body fitting, and head position still follows the body model.
+Sparse-face head orientation is off by default; `--head-orientation` opts back in.
+The 3D viewer can still display the estimated lower-body scaffold.
+
+MediaPipe's image and world landmarks now use the same physical chest/head
+definitions. Fitting combines a robust 3D prior, perspective image reprojection,
+and a time-scaled previous-pose penalty. Camera translation is refined against
+image landmarks with the chosen focal length. Elbow/knee bends are limited to a
+broad 165-degree flexion envelope; bend planes remain free. Upper-body root
+orientation uses the shoulder line and camera vertical so head bobbing does not
+rotate the entire torso.
+
+Adaptive filters use capture timestamps, suppress stationary noise, and respond
+more quickly during movement. They bound large instantaneous jumps and reset
+after observation gaps longer than half a second. The live recording overlay
+also uses adaptive 2D filtering. Final saves smooth observations in both temporal
+directions before refitting the same fixed skeleton, reducing phase lag. Hands
+and head orientation are filtered too; hand scale uses the fitted wrist's camera
+depth. Filtering does not increase detection confidence or turn missing joints
+into measurements. Frames include `reprojection_rmse_px` as an alignment diagnostic.
+
+Compatibility output retains the 133 landmark slots and the replay's 17-joint
+skeleton. Missing slots have zero confidence. MediaPipe supplies heel and foot-index
+points; it does not distinguish big and small toes, so separate small-toe slots
+are unobserved. Dense face tracking is absent. Old saves replay unchanged; record
+again to use the new estimator.
+
+To compare the previous pipeline:
+
+```sh
+cargo run --release -- --record --camera 0 --model models/rtmw-m.onnx
+```
 
 ## Upper-body focus (default)
 
@@ -36,7 +94,7 @@ ankle angles are omitted. Head and 3D hand tracking remain enabled. Add
 An upper-body-only save cannot turn its hidden slots into measured legs merely
 by passing `--full-body` to replay.
 
-For a camera facing your chest, upper-body fitting supplements weak elbow/wrist
+In the RTM/MotionAGFormer alternative, for a camera facing your chest, upper-body fitting supplements weak elbow/wrist
 depth predictions using fixed arm lengths and perspective camera rays. It uses
 the detected foreshortening only for reliable joints and a roughly frontal torso.
 The learned depth direction selects the bend; previous rotations resolve weak
@@ -60,6 +118,21 @@ relative hand-size changes improve reaching motion but do not provide metric dep
 Palm turns, occlusion, and hand-model errors can still affect the estimate. This
 requires a new recording; replaying old saved rotations does not refit them.
 
+The same relative-size principle also runs across every **observed skeletal
+segment**, including head/neck, shoulders/torso, arms, pelvis, thighs, and shins
+through the ankles. Each segment has its own reference size. The tracker measures
+its image landmark span, compensates for the lifted segment's orientation, and
+uses the change in scale to propose camera depth for its endpoints. Overlapping
+estimates are confidence-weighted, smoothed, and combined with the 3D lifting
+prior before fixed-length IK. Palm-size targets provide the more detailed wrist
+constraint when hand detections are available. This works without the hand model.
+
+These measurements are landmark spans, not body silhouette widths. Rotation
+compensation still depends on inferred 3D orientation, so turning and moving in
+depth can remain ambiguous. Hidden or unreliable segments contribute no size
+cue; default upper-body mode does not measure unseen legs. Separate toe/heel
+depth or body-surface thickness is not represented by the 17-joint skeleton.
+
 Using body axes **X forward/back, Y side-to-side, Z up/down**, a frontal camera
 maps forward toward the camera. The saved format retains camera coordinates for
 compatibility: body `(X, Y, Z) = (-camera_z, camera_x, -camera_y)` for aligned
@@ -82,9 +155,17 @@ Record:
 cargo run --release -- --record --camera 0
 ```
 
-Press **q** or **Esc** to stop capture and build the twin. Capture runs without
-neural inference; analysis takes place afterward. Video, metadata, and raw twin
-observations are kept in temporary storage, bundled into `recording.twin`, and
+The recording window shows a live **2D skeleton, hand landmarks, and joint
+angles**. Preview inference runs on a separate worker without queued frames, so capture
+never waits for the pose model and the worker starts from a fresh camera frame. The overlay shows its measurement age
+and hides estimates older than 750 ms. Preview updates may be slower than camera
+frames; every saved frame is still analyzed by the full 3D pipeline afterward.
+Your closest-person selection, detection interval, crop, and upper-body settings
+also apply to the preview. `--no-display` skips the live preview entirely.
+
+Press **q** or **Esc** to stop capture and build the twin. The source footage is
+saved before drawing overlays, so annotations never become model input. Video,
+metadata, and raw twin observations are kept in temporary storage, bundled into `recording.twin`, and
 cleaned up. The old save is replaced atomically only after the new one is complete;
 a failed or too-short recording leaves it intact.
 
@@ -147,8 +228,8 @@ Older files without timing default to 30 FPS; `--replay-fps 15` overrides timing
 The 3D view includes the 17-joint body, an outlined head with a forward-direction
 cue, and 21 landmarks per reliably detected hand. It has no skin mesh or 3D toes.
 
-Dedicated 3D hands use OpenCV Zoo's MediaPipe HandPose model, with RTMW hand
-landmarks providing aligned crops. Each subject stores shared hand bone lengths;
+Dedicated 3D hands use OpenCV Zoo's MediaPipe HandPose model, with MediaPipe Pose
+palm detections providing aligned crops and previous hand landmarks providing recovery crops. Each subject stores shared hand bone lengths;
 each frame stores incoming-bone quaternions in camera coordinates. Replay attaches
 the palm and fingers to the fitted body wrist. Learned hand depth is registered
 to body model units using image scale, so these are not metric measurements.
@@ -157,7 +238,7 @@ replay interpolates hand gaps independently when usable hand observations exist.
 model while retaining RTMW's existing 2D hand landmarks. Very small or poorly
 observed hands may not yield a 3D result.
 
-Head position follows the 3D body. Approximate orientation is fitted from reliable
+Head position follows the 3D body. With `--head-orientation`, approximate orientation is fitted from reliable
 nose, eye, and ear landmarks against a generic sparse face. When this fit is
 unavailable, replay uses the head's body-joint orientation. This is not a facial
 surface reconstruction or a measured neck rotation. Old recordings still load
@@ -175,7 +256,7 @@ span for preview/export. The source video and twin JSON are protected against
 being selected as the replay output.
 
 Supports images, video files, and webcams, annotated image/video output, and
-JSON Lines keypoint export. The default model uses 192×256 input (width × height)
+JSON Lines keypoint export. The optional RTMW model uses 192×256 input (width × height)
 and predicts 133 COCO-WholeBody landmarks:
 
 - 17 body points.
@@ -199,7 +280,7 @@ occlusion. Detection confidence breaks ties between equally sized boxes.
 
 Use `--bbox x,y,width,height` to bypass detection with a fixed manual crop, or
 `--no-detection` to estimate one full-frame pose. Detection runs on the first
-frame and every **15 frames** thereafter by default. Between refreshes, the learned
+frame and every **15 frames** thereafter by default. In the RTM alternative, between refreshes the learned
 skeletal twin can move the selected crop gradually to follow the person while
 pose estimation and angles update every frame. Before calibration is ready, or
 when the fit is unreliable, the last crop is reused. The selected person can change at a refresh when someone else has a larger
@@ -294,8 +375,9 @@ share lengths as a bilateral symmetry prior. The remaining shared segments are
 pelvis→spine, spine→thorax, thorax→nose, and nose→head; these are the model's joint
 definitions, not measurements of vertebrae or head surfaces.
 
-Calibration starts from the first valid 3D observation. Refinement begins once
-MotionAGFormer has 27 real history frames. Both endpoints must meet confidence
+Calibration starts from the first valid 3D observation. MediaPipe refinement uses
+reliable filtered observations immediately; MotionAGFormer refinement begins once
+it has 27 real history frames. Both endpoints must meet confidence
 `max(--threshold, 0.6)`. Each dimension starts with a confidence-weighted median
 over its first 31 accepted measurements, then uses a running estimate with
 bounded residuals to reduce outlier influence. Sample counts expose which
@@ -318,18 +400,19 @@ rotations, and parent-local composition. The exported `joint_names`, `parents`,
 and shared `rest_offsets` are sufficient to reconstruct every frame without the
 neural model. The root has a null parent.
 
-**Inverse kinematics** fits rotations to confidence-weighted 3D observations
-with a robust loss, damped least-squares rotational updates, and bounded steps.
-It warms up from the previous solution when helpful and never changes dimensions
+**Inverse kinematics** fits rotations to confidence-weighted observations with a
+robust loss, damped least-squares rotational updates, and bounded steps. MediaPipe
+adds perspective reprojection and time-scaled motion continuity to the 3D prior.
+The previous solution initializes the solve when helpful; dimensions never change
 inside a pose solve. `fit_rmse` reports the weighted observation residual in model
 units. Missing/low-confidence observations have zero weight. Joint-center fitting
-does not identify axial twist uniquely, and the current model uses unconstrained
-rotational joints; anatomical joint limits, meshes, skin, and contact constraints
+does not identify axial twist uniquely. MediaPipe applies broad elbow/knee bend
+limits; a calibrated anatomical hinge model, meshes, skin, and contact constraints
 are not implemented.
 
-MotionAGFormer removes global root translation. The twin therefore approximates
-root position by fitting a **weak-perspective camera** to fitted 3D joints and
-their 2D image observations. It assumes square pixels and the image center as
+The twin approximates root translation from fitted 3D joints and their image
+observations. MediaPipe refines a perspective translation fit; the MotionAGFormer
+alternative uses a weak-perspective approximation. It assumes square pixels and the image center as
 principal point. By default, focal length equals image width; provide a calibrated
 value with `--focal-length-px 900`. Each frame records whether focal length was
 assumed and whether the translation fit was valid. An invalid translation uses
@@ -421,22 +504,27 @@ before the first run; the body-only model is optional:
 
 | Model | File | Landmarks | Official archive |
 | --- | --- | --- | --- |
-| RTMW-m (default) | `models/rtmw-m.onnx` (~59 MiB) | 133: body, feet, face, hands | [Download](https://download.openmmlab.com/mmpose/v1/projects/rtmw/onnx_sdk/rtmw-dw-m-s_simcc-cocktail14_270e-256x192_20231122.zip) |
+| MediaPipe Pose (default) | `models/mediapipe-pose.onnx` (~5 MiB) | 33 native 2D/3D body points | [Download ONNX](https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/pose_estimation_mediapipe/pose_estimation_mediapipe_2023mar.onnx) |
+| RTMW-m | `models/rtmw-m.onnx` (~59 MiB) | 133: body, feet, face, hands | [Download](https://download.openmmlab.com/mmpose/v1/projects/rtmw/onnx_sdk/rtmw-dw-m-s_simcc-cocktail14_270e-256x192_20231122.zip) |
 | RTMPose-m | `models/rtmpose-m.onnx` (~52 MiB) | 17: body only | [Download](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip) |
 | YOLOX-s (detector) | `models/yolox-s.onnx` (~34 MiB) | Person bounding boxes | [Download ONNX](https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx) |
 | MotionAGFormer-XS | `models/motionagformer-xs.onnx` (~9 MiB) | 17 inferred 3D body joints | [Official H36M checkpoint](https://drive.google.com/file/d/1Pab7cPvnWG8NOVd0nnL1iqAfYCUY4hDH/view) (export below) |
+| MediaPipe Palm | `models/palmdet.onnx` (~4 MiB) | Palm boxes and 7 crop anchors | [Download ONNX](https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx) |
 | MediaPipe HandPose | `models/handpose.onnx` (~4 MiB) | 21 learned 3D points per hand | [Download ONNX](https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx) |
 
-On another machine, download the required archive and extract its `end2end.onnx`
+For the default pipeline, download the MediaPipe Pose ONNX file directly to
+`models/mediapipe-pose.onnx`. MotionAGFormer is not required for MediaPipe Pose.
+For RTM alternatives, download the archive and extract its `end2end.onnx`
 file to the corresponding model path above. For YOLOX-s, download the ONNX file
 directly to `models/yolox-s.onnx`; download the hand ONNX directly to
-`models/handpose.onnx` (or use `--no-hands`). The MotionAGFormer ONNX file is already exported
+`models/handpose.onnx` and the palm ONNX to `models/palmdet.onnx` (or use `--no-hands`).
+For a custom hand-model directory, keep `palmdet.onnx` beside the hand model. The MotionAGFormer ONNX file is already exported
 in this workspace. For a fresh clone, export its checkpoint as described below,
 or pass `--no-3d` to run the 2D pipeline.
 Models and generated outputs are excluded from Git; `Cargo.lock` is included for
 reproducible Rust dependencies.
-Use `--model /path/to/model.onnx` to load a compatible model. The supported export
-has a float32 `[1,3,256,192]` input and two raw float32 SimCC outputs,
+Use `--model /path/to/model.onnx` to load a compatible model. MediaPipe uses the documented NHWC `[1,256,256,3]` export. RTM exports
+have a float32 `[1,3,256,192]` input and two raw float32 SimCC outputs,
 `[1,K,384]` and `[1,K,512]`, where K is 17 or 133. The layout is selected from the
 output shapes. Other input resolutions and landmark layouts require code changes.
 `--detector-model /path/to/yolox-s.onnx` selects the person detector; it must use
@@ -575,10 +663,12 @@ cargo test
   [official OpenCV Zoo inference implementation](https://github.com/opencv/opencv_zoo/tree/main/models/object_detection_yolox).
 - `src/landmarks.rs`: COCO-WholeBody landmark names and body/foot/hand skeleton
   connections, using the [official MMPose dataset metadata](https://github.com/open-mmlab/mmpose/blob/main/configs/_base_/datasets/coco_wholebody.py).
+- `src/mediapipe.rs`: MediaPipe Pose preprocessing, sparse-landmark mapping, native 3D observations.
+- `src/live_preview.rs`: asynchronous recording overlay without blocking capture.
 - `src/main.rs`: CLI, capture/preview, image/video saving, JSON Lines output.
 
-Models: [official RTMPose/RTMW model zoo](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose).
-The default is RTMW-m cocktail14, 270 epochs, 256×192, `20231122`;
+Alternative models: [official RTMPose/RTMW model zoo](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose).
+The RTMW alternative is cocktail14, 270 epochs, 256×192, `20231122`;
 the original is RTMPose-m body7, 420 epochs, 256×192, `e48f03d0_20230504`.
 Preprocessing follows each selected archive's `pipeline.json` (including
 `to_rgb: true`, padding 1.25, and split ratio 2.0). Refer to

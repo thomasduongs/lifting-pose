@@ -3,7 +3,7 @@ name = "lifting-pose"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "OpenCV + RTMW-m body, hand and foot pose estimation"
+description = "OpenCV + MediaPipe body and hand pose estimation"
 license = "MIT"
 
 [dependencies]
