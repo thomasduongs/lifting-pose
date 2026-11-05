@@ -69,12 +69,39 @@ no poses are invented across tracking gaps.
 | R | Reset view |
 | Q / Esc | Close replay |
 
-Select another tracked subject segment with `--replay-subject 1`. Replay covers
-the selected segment's first through last reliable frame, retaining internal
-gaps. Older twin files without timing metadata default to 30 FPS; override timing
-with `--replay-fps 15`. The 3D view shows the 17-joint skeletal body, not a skin
-mesh or 3D fingers/toes. Root motion remains the approximate camera-space estimate
-described below.
+By default replay covers the **entire capture timeline**, including every saved
+tracking segment and gaps without reliable poses. It no longer trims to segment
+zero. Use `--replay-subject 1` to explicitly filter and trim to one segment.
+Older files without timing default to 30 FPS; `--replay-fps 15` overrides timing.
+The 3D view includes the 17-joint body, an outlined head with a forward-direction
+cue, and 21 landmarks per reliably detected hand. It has no skin mesh or 3D toes.
+
+Dedicated 3D hands use OpenCV Zoo's MediaPipe HandPose model, with RTMW hand
+landmarks providing aligned crops. Each subject stores shared hand bone lengths;
+each frame stores incoming-bone quaternions in camera coordinates. Replay attaches
+the palm and fingers to the fitted body wrist. Learned hand depth is registered
+to body model units using image scale, so these are not metric measurements.
+Low-confidence/unseen hands are omitted. `--no-hands` disables the additional
+model while retaining RTMW's existing 2D hand landmarks. Very small or poorly
+observed hands may not yield a 3D result.
+
+Head position follows the 3D body. Approximate orientation is fitted from reliable
+nose, eye, and ear landmarks against a generic sparse face. When this fit is
+unavailable, replay uses the head's body-joint orientation. This is not a facial
+surface reconstruction or a measured neck rotation. Old recordings still load
+but need reprocessing for dedicated hand and face-orientation data.
+
+Reprocess a session without replacing its original results:
+
+```sh
+cargo run --release -- --input output/session-01/source.mp4 --no-display \
+  --output output/session-01/tracked-enhanced.mp4 \
+  --twin-output output/session-01/twin-enhanced.json
+```
+
+A `source.mp4` with adjacent `capture.json` reuses the original acquisition times,
+including when imported into another session. This preserves real capture timing
+instead of substituting the video's nominal FPS.
 
 Export a shareable video of the 3D replay without opening a window:
 
@@ -169,12 +196,15 @@ illustrative timings, not a controlled benchmark.
 `history_frames`, and coordinate metadata. The pelvis is the origin; coordinates
 are **root-relative camera-space model units**, not meters, world coordinates,
 or camera distance. Each joint's `input_score` comes from the 2D input; it is not
-a confidence produced by the 3D model. The model predicts body structure, not
-3D fingers/toes or measured spine curvature. Raw `keypoints` and `pose3d` are
+a confidence produced by the 3D model. The body model predicts body structure;
+a separate model supplies 3D hands. Neither supplies 3D toes or measured spine curvature. Raw `keypoints` and `pose3d` are
 preserved; dimension-guided image-space results are exported separately under
 `tracking`. The model does not supply persistent person identities.
 
-History resets when no person is selected, the torso becomes unreliable, frame
+One uncertain shoulder/hip is permitted when the other three torso points are
+reliable. Its confidence stays low and it is excluded from confident dimension
+measurements. History resets when no person is selected, fewer than three torso
+points are reliable, frame
 resolution changes, or the selected box has little overlap with its predecessor.
 That overlap check reduces mixing across person switches but is not an identity
 tracker. Invalid limb inputs reuse the previous coordinate with zero input
@@ -335,10 +365,12 @@ before the first run; the body-only model is optional:
 | RTMPose-m | `models/rtmpose-m.onnx` (~52 MiB) | 17: body only | [Download](https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip) |
 | YOLOX-s (detector) | `models/yolox-s.onnx` (~34 MiB) | Person bounding boxes | [Download ONNX](https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx) |
 | MotionAGFormer-XS | `models/motionagformer-xs.onnx` (~9 MiB) | 17 inferred 3D body joints | [Official H36M checkpoint](https://drive.google.com/file/d/1Pab7cPvnWG8NOVd0nnL1iqAfYCUY4hDH/view) (export below) |
+| MediaPipe HandPose | `models/handpose.onnx` (~4 MiB) | 21 learned 3D points per hand | [Download ONNX](https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx) |
 
 On another machine, download the required archive and extract its `end2end.onnx`
 file to the corresponding model path above. For YOLOX-s, download the ONNX file
-directly to `models/yolox-s.onnx`. The MotionAGFormer ONNX file is already exported
+directly to `models/yolox-s.onnx`; download the hand ONNX directly to
+`models/handpose.onnx` (or use `--no-hands`). The MotionAGFormer ONNX file is already exported
 in this workspace. For a fresh clone, export its checkpoint as described below,
 or pass `--no-3d` to run the 2D pipeline.
 Models and generated outputs are excluded from Git; `Cargo.lock` is included for
@@ -492,3 +524,6 @@ Preprocessing follows each selected archive's `pipeline.json` (including
 `to_rgb: true`, padding 1.25, and split ratio 2.0). Refer to
 [MMPose's inference example](https://github.com/open-mmlab/mmpose/blob/main/projects/rtmpose/examples/onnxruntime/main.py)
 for the affine/SimCC pipeline and to the upstream project for model licensing.
+
+The additional head/hand implementation is in `src/details.rs`; the hand model
+interface follows the [official OpenCV Zoo example](https://github.com/opencv/opencv_zoo/tree/main/models/handpose_estimation_mediapipe).

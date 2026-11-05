@@ -1,5 +1,6 @@
 //! Shared body dimensions plus per-frame rotations. Online calibration is
 //! provisional; final export re-solves every frame using one final shape per subject.
+use crate::details::{HAND_PARENT, HandFrame, HandPose, HandShape, HeadPose};
 use crate::{
     motion3d::{self, Joint3d, Pose3d},
     pose::{Bbox, Keypoint},
@@ -231,6 +232,7 @@ impl Calibration {
             rest_offsets: dimensions.offsets().map(array),
             bilateral_symmetry: true,
             calibration_frames: self.frames,
+            hands: BTreeMap::new(),
             measurement_counts: (0..10)
                 .map(|i| (DIMENSIONS[i], self.estimates[i].samples))
                 .collect(),
@@ -250,6 +252,7 @@ pub struct PersonParameters {
     bilateral_symmetry: bool,
     calibration_frames: u64,
     measurement_counts: BTreeMap<&'static str, u64>,
+    hands: BTreeMap<String, HandShape>,
 }
 
 #[derive(Clone)]
@@ -263,6 +266,8 @@ struct Observation {
     focal: f64,
     assumed_focal: bool,
     history_frames: usize,
+    hands: Vec<HandPose>,
+    head: Option<HeadPose>,
 }
 
 fn descendant(mut node: usize, ancestor: usize) -> bool {
@@ -430,6 +435,8 @@ pub struct FrameParameters {
     focal_length_assumed: bool,
     fit_rmse: f64,
     angles: Vec<crate::angles::JointAngle>,
+    hands: Vec<HandFrame>,
+    head: Option<HeadPose>,
 }
 
 /// Weak-perspective translation: model scale/depth is a gauge, not metric camera tracking.
@@ -506,6 +513,8 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
         focal_length_assumed: obs.assumed_focal,
         fit_rmse,
         angles: motion3d::angles3d(&fitted_joints, 0.0),
+        hands: Vec::new(),
+        head: obs.head.clone(),
     }
 }
 
@@ -554,9 +563,122 @@ impl TwinPreview {
 }
 struct Subject {
     calibration: Calibration,
+    hand_shapes: BTreeMap<String, Vec<Estimate>>,
     observations: Vec<Observation>,
     previous: Option<Pose>,
 }
+fn registered_vectors(hand: &HandPose, frame: &FrameParameters) -> Option<[V; 21]> {
+    if !frame.root_translation_valid || frame.root_position[2] <= 0.0 {
+        return None;
+    }
+    let world: [V; 21] = std::array::from_fn(|i| {
+        V::new(
+            hand.world_landmarks[i][0] as f64,
+            hand.world_landmarks[i][1] as f64,
+            hand.world_landmarks[i][2] as f64,
+        )
+    });
+    let relative = world.map(|p| p - world[0]);
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for (i, p) in relative.iter().enumerate().skip(1) {
+        numerator += p.x * f64::from(hand.image_landmarks[i][0] - hand.image_landmarks[0][0])
+            + p.y * f64::from(hand.image_landmarks[i][1] - hand.image_landmarks[0][1]);
+        denominator += p.x * p.x + p.y * p.y;
+    }
+    let scale =
+        numerator / denominator.max(1e-12) / (frame.focal_length_px / frame.root_position[2]);
+    if !scale.is_finite() || !(0.001..100.0).contains(&scale) {
+        return None;
+    }
+    let result = relative.map(|p| p * scale);
+    (1..21)
+        .all(|i| (result[i] - result[HAND_PARENT[i]]).norm() > 1e-7)
+        .then_some(result)
+}
+impl Subject {
+    fn parameters(&self) -> PersonParameters {
+        let mut parameters = self.calibration.parameters();
+        parameters.hands = self
+            .hand_shapes
+            .iter()
+            .map(|(side, lengths)| {
+                (
+                    side.clone(),
+                    HandShape {
+                        bone_lengths: lengths.iter().map(|e| e.value).collect(),
+                        measurement_count: lengths
+                            .iter()
+                            .skip(1)
+                            .map(|e| e.samples)
+                            .min()
+                            .unwrap_or(0),
+                    },
+                )
+            })
+            .collect();
+        parameters
+    }
+    fn learn_hands(&mut self, obs: &Observation, pose: &Pose) {
+        let frame = frame_parameters(self.calibration.dimensions(), obs, pose);
+        for hand in &obs.hands {
+            let Some(points) = registered_vectors(hand, &frame) else {
+                continue;
+            };
+            let lengths = self
+                .hand_shapes
+                .entry(hand.side.clone())
+                .or_insert_with(|| {
+                    (0..21)
+                        .map(|i| {
+                            Estimate::new(if i == 0 {
+                                0.0
+                            } else {
+                                (points[i] - points[HAND_PARENT[i]]).norm()
+                            })
+                        })
+                        .collect()
+                });
+            if obs.history_frames >= 27 && hand.confidence >= 0.8 {
+                for i in 1..21 {
+                    lengths[i].add(
+                        (points[i] - points[HAND_PARENT[i]]).norm(),
+                        f64::from(hand.confidence).powi(2),
+                    );
+                }
+            }
+        }
+    }
+    fn frame(&self, obs: &Observation, pose: &Pose) -> FrameParameters {
+        let mut frame = frame_parameters(self.calibration.dimensions(), obs, pose);
+        for hand in &obs.hands {
+            if !self.hand_shapes.contains_key(&hand.side) {
+                continue;
+            }
+            let Some(points) = registered_vectors(hand, &frame) else {
+                continue;
+            };
+            let rotations = (0..21)
+                .map(|i| {
+                    let rotation = if i == 0 {
+                        Q::identity()
+                    } else {
+                        Q::rotation_between(&V::y(), &(points[i] - points[HAND_PARENT[i]]))
+                            .unwrap_or(Q::identity())
+                    };
+                    quaternion(rotation)
+                })
+                .collect();
+            frame.hands.push(HandFrame {
+                side: hand.side.clone(),
+                confidence: hand.confidence,
+                bone_rotations_xyzw: rotations,
+            });
+        }
+        frame
+    }
+}
+
 #[derive(Default)]
 pub struct TwinRecorder {
     subjects: Vec<Subject>,
@@ -587,6 +709,8 @@ impl TwinRecorder {
         frame: u64,
         pose: &Pose3d,
         points: &[Keypoint],
+        hands: &[HandPose],
+        head: Option<HeadPose>,
         bbox: Bbox,
         size: Size,
         threshold: f32,
@@ -632,6 +756,8 @@ impl TwinRecorder {
             focal: focal.unwrap_or(size.width as f64),
             assumed_focal: focal.is_none(),
             history_frames: pose.history_frames,
+            hands: hands.to_vec(),
+            head,
         };
         if obs.points.iter().any(|p| !p.iter().all(|x| x.is_finite()))
             || obs.scores.iter().filter(|&&s| s > 0.0).count() < 4
@@ -649,6 +775,7 @@ impl TwinRecorder {
         if new {
             self.subjects.push(Subject {
                 calibration: Calibration::new(&obs),
+                hand_shapes: BTreeMap::new(),
                 observations: Vec::new(),
                 previous: None,
             });
@@ -663,7 +790,8 @@ impl TwinRecorder {
             .update(&obs, f64::from(threshold.max(0.6)));
         let dimensions = subject.calibration.dimensions();
         let solved = inverse(dimensions, &obs, subject.previous.as_ref());
-        let parameters = frame_parameters(dimensions, &obs, &solved);
+        subject.learn_hands(&obs, &solved);
+        let parameters = subject.frame(&obs, &solved);
         let fitted = forward(dimensions, &solved).0;
         let joints: Vec<_> = (0..N)
             .map(|i| Joint3d {
@@ -687,7 +815,7 @@ impl TwinRecorder {
         Some(TwinPreview {
             subject_segment,
             provisional: true,
-            person: subject.calibration.parameters(),
+            person: subject.parameters(),
             frame: parameters,
             fitted_pose,
         })
@@ -722,7 +850,7 @@ impl TwinRecorder {
                 writer.write_all(b",")?;
             }
             write!(writer, "{{\"subject_segment\":{index},\"person\":")?;
-            serde_json::to_writer(&mut writer, &subject.calibration.parameters())?;
+            serde_json::to_writer(&mut writer, &subject.parameters())?;
             writer.write_all(b",\"frames\":[")?;
             let dimensions = subject.calibration.dimensions();
             let mut previous = None;
@@ -731,7 +859,7 @@ impl TwinRecorder {
                     writer.write_all(b",")?;
                 }
                 let pose = inverse(dimensions, obs, previous.as_ref());
-                let frame = frame_parameters(dimensions, obs, &pose);
+                let frame = subject.frame(obs, &pose);
                 ensure!(frame.fit_rmse.is_finite(), "Non-finite skeletal twin fit");
                 serde_json::to_writer(&mut writer, &frame)?;
                 previous = Some(pose);
@@ -762,6 +890,8 @@ mod tests {
             focal: 800.0,
             assumed_focal: false,
             history_frames: 27,
+            hands: Vec::new(),
+            head: None,
         }
     }
     fn pose() -> Pose {
@@ -899,6 +1029,7 @@ mod tests {
         let first = observation(0, &pose());
         let mut subject = Subject {
             calibration: Calibration::new(&first),
+            hand_shapes: BTreeMap::new(),
             observations: Vec::new(),
             previous: None,
         };

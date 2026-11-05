@@ -20,4 +20,4 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-The RTMPose, RTMW, YOLOX, and MotionAGFormer models are distributed separately under their upstream licenses.
+The RTMPose, RTMW, YOLOX, MotionAGFormer, and MediaPipe hand models are distributed separately under their upstream licenses.

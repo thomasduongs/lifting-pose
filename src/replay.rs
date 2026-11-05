@@ -1,5 +1,6 @@
 //! Model-free skeletal-twin playback: deserialize shared offsets + local quaternions,
 //! reconstruct with FK, and render from an orbitable perspective camera.
+use crate::details::{HAND_PARENT, HandFrame, HandShape, HeadPose};
 use anyhow::{Context, Result, ensure};
 use nalgebra::{Quaternion, Rotation3, UnitQuaternion, Vector3};
 use opencv::{
@@ -9,6 +10,7 @@ use opencv::{
     videoio,
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::{
     fs::File,
     path::Path,
@@ -45,6 +47,8 @@ struct Subject {
 #[derive(Deserialize)]
 struct Person {
     rest_offsets: Vec<[f64; 3]>,
+    #[serde(default)]
+    hands: BTreeMap<String, HandShape>,
 }
 #[derive(Deserialize)]
 struct Frame {
@@ -52,6 +56,10 @@ struct Frame {
     root_position: [f64; 3],
     root_orientation_xyzw: [f64; 4],
     joint_rotations: Vec<JointRotation>,
+    #[serde(default)]
+    hands: Vec<HandFrame>,
+    #[serde(default)]
+    head: Option<HeadPose>,
 }
 #[derive(Deserialize)]
 struct JointRotation {
@@ -121,6 +129,16 @@ impl Recording {
                     .all(|v| v.is_finite() && v.abs() < 1e9),
                 "Invalid person dimensions"
             );
+            for shape in subject.person.hands.values() {
+                ensure!(
+                    shape.bone_lengths.len() == 21
+                        && shape
+                            .bone_lengths
+                            .iter()
+                            .all(|v| v.is_finite() && *v >= 0.0 && *v < 10.0),
+                    "Invalid shared hand lengths"
+                );
+            }
             let mut last = None;
             for f in &subject.frames {
                 ensure!(
@@ -135,6 +153,23 @@ impl Recording {
                     "Invalid root position"
                 );
                 rotation(f.root_orientation_xyzw)?;
+                if let Some(head) = &f.head {
+                    rotation(head.orientation_xyzw)?;
+                }
+                for hand in &f.hands {
+                    ensure!(
+                        subject.person.hands.contains_key(&hand.side)
+                            && matches!(hand.side.as_str(), "left" | "right"),
+                        "Missing/invalid hand shape"
+                    );
+                    ensure!(
+                        hand.bone_rotations_xyzw.len() == 21,
+                        "Expected 21 hand bone rotations"
+                    );
+                    for &q in &hand.bone_rotations_xyzw {
+                        rotation(q)?;
+                    }
+                }
                 ensure!(
                     f.joint_rotations.len() == N,
                     "Missing per-frame joint rotations"
@@ -203,6 +238,21 @@ impl Recording {
         }
         frame as f64 / fps
     }
+}
+
+fn hand_positions(subject: &Subject, frame: &Frame, body: &[V; N]) -> Result<Vec<[V; 21]>> {
+    let mut result = Vec::new();
+    for hand in &frame.hands {
+        let shape = &subject.person.hands[&hand.side];
+        let mut points = [V::zeros(); 21];
+        points[0] = body[if hand.side == "left" { 13 } else { 16 }];
+        for i in 1..21 {
+            points[i] = points[HAND_PARENT[i]]
+                + rotation(hand.bone_rotations_xyzw[i])? * V::y() * shape.bone_lengths[i];
+        }
+        result.push(points);
+    }
+    Ok(result)
 }
 
 struct Bounds {
@@ -332,6 +382,62 @@ fn render(
                 project(positions[i]),
             ) {
                 imgproc::line(&mut image, a, b, color, 6, imgproc::LINE_AA, 0)?;
+            }
+        }
+        // Head position follows the 3D body; sparse face fitting supplies orientation when available.
+        let orientation = if let Some(head) = &pose.head {
+            rotation(head.orientation_xyzw)?
+        } else {
+            rotation(pose.root_orientation_xyzw)?
+                * rotation(pose.joint_rotations[7].quaternion_xyzw)?
+                * rotation(pose.joint_rotations[8].quaternion_xyzw)?
+                * rotation(pose.joint_rotations[9].quaternion_xyzw)?
+        };
+        let center = (positions[9] + positions[10]) / 2.0;
+        let radius = ((positions[10] - positions[9]).norm() * 0.85).max(0.015);
+        let head_point = |p: V| project(center + orientation * p);
+        for plane in 0..3 {
+            let mut previous = None;
+            for step in 0..=32 {
+                let angle = step as f64 * std::f64::consts::TAU / 32.0;
+                let (a, b) = (angle.cos() * radius, angle.sin() * radius);
+                let p = match plane {
+                    0 => V::new(a * 0.8, b * 1.1, 0.0),
+                    1 => V::new(a * 0.8, 0.0, b * 0.8),
+                    _ => V::new(0.0, a * 1.1, b * 0.8),
+                };
+                let current = head_point(p);
+                if let (Some(a), Some(b)) = (previous, current) {
+                    imgproc::line(&mut image, a, b, Scalar::all(225.0), 2, imgproc::LINE_AA, 0)?;
+                }
+                previous = current;
+            }
+        }
+        if let (Some(a), Some(b)) = (project(center), head_point(V::new(0.0, 0.0, -radius * 1.5))) {
+            imgproc::line(
+                &mut image,
+                a,
+                b,
+                Scalar::new(90.0, 240.0, 90.0, 0.0),
+                3,
+                imgproc::LINE_AA,
+                0,
+            )?;
+        }
+        for hand in hand_positions(subject, pose, &positions)? {
+            let color = Scalar::new(220.0, 90.0, 230.0, 0.0);
+            for i in 1..21 {
+                if let (Some(a), Some(b)) = (project(hand[HAND_PARENT[i]]), project(hand[i])) {
+                    imgproc::line(&mut image, a, b, color, 2, imgproc::LINE_AA, 0)?;
+                }
+                if let Some(p) = project(hand[i]) {
+                    imgproc::circle(&mut image, p, 2, color, -1, imgproc::LINE_AA, 0)?;
+                }
+            }
+            for pair in [0, 5, 9, 13, 17, 0].windows(2) {
+                if let (Some(a), Some(b)) = (project(hand[pair[0]]), project(hand[pair[1]])) {
+                    imgproc::line(&mut image, a, b, color, 2, imgproc::LINE_AA, 0)?;
+                }
             }
         }
         for (i, p) in positions.iter().enumerate() {
@@ -668,6 +774,7 @@ mod tests {
             subject_segment: 0,
             person: Person {
                 rest_offsets: offsets,
+                hands: BTreeMap::new(),
             },
             frames: Vec::new(),
         };
@@ -681,6 +788,8 @@ mod tests {
                     quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
                 })
                 .collect(),
+            hands: Vec::new(),
+            head: None,
         };
         frame.joint_rotations[1].quaternion_xyzw = [0.0, 0.0, 0.5_f64.sqrt(), 0.5_f64.sqrt()];
         let positions = record.positions(&subject, &frame, false).unwrap();
@@ -739,5 +848,92 @@ mod tests {
         write(&value);
         assert!(Recording::load(&path).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn default_replay_keeps_full_capture_even_when_tracking_is_split() {
+        let frame = |frame| Frame {
+            frame,
+            root_position: [0.0; 3],
+            root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            joint_rotations: (0..17)
+                .map(|i| JointRotation {
+                    joint: format!("j{i}"),
+                    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
+                })
+                .collect(),
+            hands: Vec::new(),
+            head: None,
+        };
+        let subject = |id, a, b| Subject {
+            subject_segment: id,
+            person: Person {
+                rest_offsets: vec![[0.0, 1.0, 0.0]; 17],
+                hands: BTreeMap::new(),
+            },
+            frames: vec![frame(a), frame(b)],
+        };
+        let record = Recording {
+            schema_version: 1,
+            quaternion_convention: "xyzw_active_parent_local".into(),
+            joint_names: (0..17).map(|i| format!("j{i}")).collect(),
+            parents: (0..17)
+                .map(|i| if i == 0 { None } else { Some(0) })
+                .collect(),
+            recording: Some(Timing {
+                fps: 30.0,
+                frame_count: 333,
+                timestamps_seconds: (0..333).map(|i| i as f64 * 11.795 / 332.0).collect(),
+                source_video: None,
+            }),
+            subjects: vec![
+                subject(0, 0, 81),
+                subject(1, 120, 191),
+                subject(2, 292, 332),
+            ],
+        };
+        let selected: Vec<_> = record.subjects.iter().collect();
+        assert_eq!(playback_range(&record, &selected, false), (0, 333));
+        assert_eq!(playback_range(&record, &selected[..1], true), (0, 82));
+        assert!(record.time(332, 30.0, false) + 1.0 / 30.0 > 11.8);
+    }
+    #[test]
+    fn hand_replay_uses_shared_lengths_and_attaches_to_body_wrist() {
+        let mut shapes = BTreeMap::new();
+        shapes.insert(
+            "left".into(),
+            HandShape {
+                bone_lengths: vec![0.02; 21],
+                measurement_count: 20,
+            },
+        );
+        let subject = Subject {
+            subject_segment: 0,
+            person: Person {
+                rest_offsets: Vec::new(),
+                hands: shapes,
+            },
+            frames: Vec::new(),
+        };
+        let q = Q::from_euler_angles(0.6, 0.0, 0.0);
+        let q = q.quaternion();
+        let frame = Frame {
+            frame: 0,
+            root_position: [0.0; 3],
+            root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            joint_rotations: Vec::new(),
+            head: None,
+            hands: vec![HandFrame {
+                side: "left".into(),
+                confidence: 0.9,
+                bone_rotations_xyzw: vec![[q.i, q.j, q.k, q.w]; 21],
+            }],
+        };
+        let body = [V::new(1.0, 2.0, 3.0); 17];
+        let hands = hand_positions(&subject, &frame, &body).unwrap();
+        assert_eq!(hands[0][0], body[13]);
+        for i in 1..21 {
+            assert!(((hands[0][i] - hands[0][HAND_PARENT[i]]).norm() - 0.02).abs() < 1e-12);
+        }
+        assert!(hands[0][4].z > hands[0][0].z);
     }
 }

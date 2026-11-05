@@ -126,10 +126,15 @@ impl History {
                 && p.x < size.width as f32
                 && p.y < size.height as f32
         };
-        // Without a reliable torso there is no dependable person reference for lifting.
-        if [5, 6, 11, 12]
+        // One occluded shoulder/hip should not discard an otherwise usable body pose.
+        // Confidence remains low in the model input and in downstream calibration.
+        let torso = [5, 6, 11, 12];
+        let reliable = torso
             .iter()
-            .any(|&i| !valid(&points[i]) || points[i].score < threshold)
+            .filter(|&&i| valid(&points[i]) && points[i].score >= threshold)
+            .count();
+        if reliable < 3
+            || (self.previous_coco.is_none() && torso.iter().any(|&i| !valid(&points[i])))
         {
             self.clear();
             return false;
@@ -459,9 +464,11 @@ mod tests {
         assert!(h.push(&p, switched, Size::new(640, 480), 0.3));
         assert_eq!(h.frames.len(), 1);
         p[5].score = 0.1;
+        p[6].score = 0.1;
         assert!(!h.push(&p, switched, Size::new(640, 480), 0.3));
         assert!(h.frames.is_empty());
         p[5].score = 0.9;
+        p[6].score = 0.9;
         h.push(&p, bbox(), Size::new(640, 480), 0.3);
         h.push(&p, bbox(), Size::new(1280, 720), 0.3);
         assert_eq!(h.frames.len(), 1);
@@ -488,5 +495,17 @@ mod tests {
         assert_eq!(knee.degrees, Some(90.0));
         joints[6].input_score = 0.1;
         assert!(angles3d(&joints, 0.3)[6].degrees.is_none());
+    }
+    #[test]
+    fn one_uncertain_torso_landmark_preserves_temporal_pose_without_raising_confidence() {
+        let mut history = History::default();
+        let mut p = points();
+        assert!(history.push(&p, bbox(), Size::new(640, 480), 0.3));
+        p[5].score = 0.1;
+        assert!(history.push(&p, bbox(), Size::new(640, 480), 0.3));
+        assert_eq!(history.frames.len(), 2);
+        assert_eq!(history.frames.back().unwrap()[11][2], 0.1);
+        p[6].score = 0.1;
+        assert!(!history.push(&p, bbox(), Size::new(640, 480), 0.3));
     }
 }

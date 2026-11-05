@@ -1,4 +1,5 @@
 mod angles;
+mod details;
 mod detection_cache;
 mod detector;
 mod landmarks;
@@ -50,6 +51,11 @@ struct Args {
     /// Override recorded replay timing with a constant frame rate.
     #[arg(long, requires = "replay", value_parser = parse_positive)]
     replay_fps: Option<f64>,
+    /// Dedicated 21-point 3D hand model (OpenCV Zoo MediaPipe).
+    #[arg(long, default_value = "models/handpose.onnx")]
+    hand_model: PathBuf,
+    #[arg(long)]
+    no_hands: bool,
     #[arg(long, default_value = "models/rtmw-m.onnx")]
     model: PathBuf,
     /// MotionAGFormer-XS H36M ONNX export for 3D body lifting.
@@ -171,6 +177,8 @@ struct PersonPose {
     pose3d: Option<motion3d::Pose3d>,
     twin: Option<twin::TwinPreview>,
     tracking: Option<tracking::TrackingResult>,
+    hands: Vec<details::HandPose>,
+    head: Option<details::HeadPose>,
 }
 
 #[derive(Serialize)]
@@ -189,6 +197,7 @@ fn process(
     detector: &mut Option<PersonDetector>,
     detection_cache: &mut DetectionCache,
     lifter: &mut Option<MotionLifter>,
+    hand_model: &mut Option<details::HandModel>,
     twin_recorder: &mut twin::TwinRecorder,
     dimension_tracker: &mut tracking::DimensionTracker,
     args: &Args,
@@ -231,6 +240,11 @@ fn process(
     let mut people = Vec::with_capacity(crops.len());
     for (person_index, (bbox, detection_score)) in crops.into_iter().enumerate() {
         let keypoints = estimator.infer(frame, bbox)?;
+        let hands = match hand_model.as_mut() {
+            Some(model) => model.infer(frame, &keypoints)?,
+            None => Vec::new(),
+        };
+        let head = details::head_pose(&keypoints, args.threshold);
         let angles = angles::calculate(
             &keypoints,
             args.threshold,
@@ -245,6 +259,8 @@ fn process(
                 index,
                 pose,
                 &keypoints,
+                &hands,
+                head.clone(),
                 bbox,
                 Size::new(frame.cols(), frame.rows()),
                 args.threshold,
@@ -276,6 +292,8 @@ fn process(
             pose3d,
             twin,
             tracking,
+            hands,
+            head,
         });
     }
     let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -299,6 +317,7 @@ fn process(
         } else {
             pose::draw(frame, &person.keypoints, args.threshold)?;
         }
+        details::draw_hands(frame, &person.hands)?;
         let b = person.bbox;
         let left = b.x.floor() as i32;
         let top = b.y.floor() as i32;
@@ -390,6 +409,13 @@ fn main() -> Result<()> {
                 path.display()
             );
         }
+        if !args.no_hands {
+            ensure!(
+                args.hand_model.is_file(),
+                "Hand model missing: {}",
+                args.hand_model.display()
+            );
+        }
         if !args.no_detection && args.bbox.is_none() {
             ensure!(
                 args.detector_model.is_file(),
@@ -417,7 +443,11 @@ fn main() -> Result<()> {
         args.no_display = true;
         Some(captured)
     } else {
-        None
+        args.input
+            .as_deref()
+            .map(recording::existing_timing)
+            .transpose()?
+            .flatten()
     };
     // Avoid truncating an input or model through an accidentally reused output path.
     for destination in args
@@ -426,11 +456,12 @@ fn main() -> Result<()> {
         .chain(args.json.iter())
         .chain(std::iter::once(&args.twin_output))
     {
-        for source in
-            args.input
-                .iter()
-                .chain([&args.model, &args.detector_model, &args.motion_model])
-        {
+        for source in args.input.iter().chain([
+            &args.model,
+            &args.detector_model,
+            &args.motion_model,
+            &args.hand_model,
+        ]) {
             if destination.exists() && source.exists() {
                 ensure!(
                     destination.canonicalize()? != source.canonicalize()?,
@@ -472,6 +503,11 @@ fn main() -> Result<()> {
     } else {
         Some(MotionLifter::new(&args.motion_model)?)
     };
+    let mut hand_model = if args.no_hands {
+        None
+    } else {
+        Some(details::HandModel::new(&args.hand_model)?)
+    };
     let mut twin_recorder = twin::TwinRecorder::default();
     let mut dimension_tracker = tracking::DimensionTracker::default();
     let mut json = args
@@ -503,6 +539,7 @@ fn main() -> Result<()> {
             &mut detector,
             &mut detection_cache,
             &mut lifter,
+            &mut hand_model,
             &mut twin_recorder,
             &mut dimension_tracker,
             &args,
@@ -555,6 +592,7 @@ fn main() -> Result<()> {
                 &mut detector,
                 &mut detection_cache,
                 &mut lifter,
+                &mut hand_model,
                 &mut twin_recorder,
                 &mut dimension_tracker,
                 &args,

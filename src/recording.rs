@@ -6,18 +6,47 @@ use opencv::{
     prelude::*,
     videoio,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     path::{Path, PathBuf},
     time::Instant,
 };
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Capture {
     pub source: PathBuf,
     pub fps: f64,
     pub timestamps_seconds: Vec<f64>,
+}
+
+/// Reprocessing a recorded source must retain acquisition times, not its nominal codec FPS.
+pub fn existing_timing(input: &Path) -> Result<Option<Capture>> {
+    if input.file_name().and_then(|p| p.to_str()) != Some("source.mp4") {
+        return Ok(None);
+    }
+    let metadata = input
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("capture.json");
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let mut timing: Capture = serde_json::from_reader(File::open(metadata)?)
+        .context("Invalid capture timing metadata")?;
+    ensure!(
+        timing.fps.is_finite()
+            && timing.fps > 0.0
+            && !timing.timestamps_seconds.is_empty()
+            && timing
+                .timestamps_seconds
+                .iter()
+                .all(|t| t.is_finite() && *t >= 0.0)
+            && timing.timestamps_seconds.windows(2).all(|p| p[1] > p[0]),
+        "Invalid capture timestamps"
+    );
+    timing.source = input.to_owned();
+    Ok(Some(timing))
 }
 
 pub fn capture(
@@ -49,7 +78,11 @@ pub fn capture(
         capture.is_opened()?,
         "Cannot open recording source; check camera permissions/source path"
     );
-    let fps = capture.get(videoio::CAP_PROP_FPS)?;
+    let original_timing = input.map(existing_timing).transpose()?.flatten();
+    let fps = original_timing
+        .as_ref()
+        .map(|t| t.fps)
+        .unwrap_or(capture.get(videoio::CAP_PROP_FPS)?);
     let fps = if fps.is_finite() && fps > 0.0 {
         fps
     } else {
@@ -69,7 +102,10 @@ pub fn capture(
         }
         let start = start.get_or_insert_with(Instant::now);
         let elapsed = if input.is_some() {
-            timestamps_seconds.len() as f64 / fps
+            original_timing
+                .as_ref()
+                .and_then(|t| t.timestamps_seconds.get(timestamps_seconds.len()).copied())
+                .unwrap_or(timestamps_seconds.len() as f64 / fps)
         } else {
             start.elapsed().as_secs_f64()
         };
