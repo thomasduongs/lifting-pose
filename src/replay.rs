@@ -20,7 +20,7 @@ use std::{
 type V = Vector3<f64>;
 type Q = UnitQuaternion<f64>;
 const N: usize = 17;
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Recording {
     schema_version: u32,
     quaternion_convention: String,
@@ -30,28 +30,40 @@ struct Recording {
     recording: Option<Timing>,
     subjects: Vec<Subject>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Timing {
     fps: f64,
     frame_count: u64,
     timestamps_seconds: Vec<f64>,
     #[serde(default)]
     source_video: Option<String>,
+    #[serde(default = "default_trim")]
+    trim_start_seconds: f64,
+    #[serde(default = "default_trim")]
+    trim_end_seconds: f64,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Subject {
     subject_segment: usize,
     person: Person,
     frames: Vec<Frame>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Person {
     rest_offsets: Vec<[f64; 3]>,
     #[serde(default)]
     hands: BTreeMap<String, HandShape>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Default, Deserialize)]
+struct Prediction {
+    body: bool,
+    hands: bool,
+    head: bool,
+}
+#[derive(Clone, Deserialize)]
 struct Frame {
+    #[serde(default)]
+    prediction: Prediction,
     frame: u64,
     root_position: [f64; 3],
     root_orientation_xyzw: [f64; 4],
@@ -61,7 +73,7 @@ struct Frame {
     #[serde(default)]
     head: Option<HeadPose>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct JointRotation {
     joint: String,
     quaternion_xyzw: [f64; 4],
@@ -73,6 +85,12 @@ pub struct Options<'a> {
     pub subject: Option<usize>,
     pub fps: Option<f64>,
     pub max_frames: Option<u64>,
+    pub trim_start: Option<f64>,
+    pub trim_end: Option<f64>,
+}
+
+fn default_trim() -> f64 {
+    3.0
 }
 
 fn vector(p: [f64; 3]) -> V {
@@ -370,7 +388,9 @@ fn render(
     if let Some((subject, pose)) = current {
         let positions = record.positions(subject, pose, view.follow)?;
         for i in 1..N {
-            let color = if record.joint_names[i].starts_with("left_") {
+            let color = if pose.prediction.body {
+                Scalar::new(165.0, 165.0, 165.0, 0.0)
+            } else if record.joint_names[i].starts_with("left_") {
                 Scalar::new(60.0, 180.0, 255.0, 0.0)
             } else if record.joint_names[i].starts_with("right_") {
                 Scalar::new(255.0, 205.0, 65.0, 0.0)
@@ -425,7 +445,11 @@ fn render(
             )?;
         }
         for hand in hand_positions(subject, pose, &positions)? {
-            let color = Scalar::new(220.0, 90.0, 230.0, 0.0);
+            let color = if pose.prediction.hands {
+                Scalar::all(150.0)
+            } else {
+                Scalar::new(220.0, 90.0, 230.0, 0.0)
+            };
             for i in 1..21 {
                 if let (Some(a), Some(b)) = (project(hand[HAND_PARENT[i]]), project(hand[i])) {
                     imgproc::line(&mut image, a, b, color, 2, imgproc::LINE_AA, 0)?;
@@ -499,10 +523,18 @@ fn render(
         ),
         (
             format!(
-                "{} | {:.2}x | {}",
+                "{} | {:.2}x | {} | {}",
                 if paused { "Paused" } else { "Playing" },
                 speed,
-                mode
+                mode,
+                if current.is_some_and(|(_, p)| p.prediction.body
+                    || p.prediction.hands
+                    || p.prediction.head)
+                {
+                    "Predicted motion"
+                } else {
+                    "Observed fit"
+                }
             ),
             58,
             0.5,
@@ -560,6 +592,224 @@ fn playback_range(record: &Recording, subjects: &[&Subject], filtered: bool) -> 
     (first, end)
 }
 
+fn q_array(q: Q) -> [f64; 4] {
+    let q = Q::new_normalize(*q.quaternion());
+    let q = q.quaternion();
+    [q.i, q.j, q.k, q.w]
+}
+fn blend_rotation(a: [f64; 4], b: [f64; 4], amount: f64) -> Result<[f64; 4]> {
+    Ok(q_array(rotation(a)?.slerp(&rotation(b)?, amount)))
+}
+fn bracket<T>(items: &[(u64, T)], frame: u64) -> (usize, usize) {
+    let i = items.partition_point(|p| p.0 < frame);
+    if i < items.len() && items[i].0 == frame {
+        (i, i)
+    } else {
+        (i.saturating_sub(1), i.min(items.len() - 1))
+    }
+}
+fn amount(record: &Recording, a: u64, b: u64, frame: u64, fps: f64, override_fps: bool) -> f64 {
+    if a == b {
+        0.0
+    } else {
+        ((record.time(frame, fps, override_fps) - record.time(a, fps, override_fps))
+            / (record.time(b, fps, override_fps) - record.time(a, fps, override_fps)))
+        .clamp(0.0, 1.0)
+    }
+}
+
+/// Offline motion completion. A single shared shape is used throughout playback;
+/// rotations are interpolated, never joint coordinates or bone lengths.
+fn complete_motion(
+    record: &Recording,
+    subjects: &[&Subject],
+    fps: f64,
+    override_fps: bool,
+) -> Result<Subject> {
+    let reference = subjects.iter().max_by_key(|s| s.frames.len()).unwrap();
+    let mut person = reference.person.clone();
+    for subject in subjects {
+        for (side, shape) in &subject.person.hands {
+            if person
+                .hands
+                .get(side)
+                .is_none_or(|old| shape.measurement_count > old.measurement_count)
+            {
+                person.hands.insert(side.clone(), shape.clone());
+            }
+        }
+    }
+    let mut anchors: Vec<_> = subjects
+        .iter()
+        .flat_map(|s| s.frames.iter().map(|f| (f.frame, f)))
+        .collect();
+    anchors.sort_by_key(|a| a.0);
+    anchors.dedup_by_key(|a| a.0);
+    let first = anchors.first().unwrap().0;
+    let end = record
+        .recording
+        .as_ref()
+        .map(|t| t.frame_count)
+        .unwrap_or(anchors.last().unwrap().0 + 1);
+    let hand_anchors: Vec<_> = ["left", "right"]
+        .iter()
+        .map(|side| {
+            anchors
+                .iter()
+                .filter_map(|(i, f)| f.hands.iter().find(|h| h.side == *side).map(|h| (*i, h)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let head_anchors: Vec<_> = anchors
+        .iter()
+        .filter_map(|(i, f)| f.head.as_ref().map(|h| (*i, h)))
+        .collect();
+    let mut frames = Vec::new();
+    for frame in first..end {
+        let (ai, bi) = bracket(&anchors, frame);
+        let a = anchors[ai].1;
+        let b = anchors[bi].1;
+        let t = amount(record, a.frame, b.frame, frame, fps, override_fps);
+        let mut result = a.clone();
+        result.frame = frame;
+        result.prediction = Prediction::default();
+        if a.frame != frame {
+            result.prediction.body = true;
+            result.root_orientation_xyzw =
+                blend_rotation(a.root_orientation_xyzw, b.root_orientation_xyzw, t)?;
+            for i in 0..N {
+                result.joint_rotations[i].quaternion_xyzw = blend_rotation(
+                    a.joint_rotations[i].quaternion_xyzw,
+                    b.joint_rotations[i].quaternion_xyzw,
+                    t,
+                )?;
+            }
+            // Monotone Hermite root motion: surrounding velocities, bounded against overshoot.
+            let dt = (record.time(b.frame, fps, override_fps)
+                - record.time(a.frame, fps, override_fps))
+            .max(1e-6);
+            let previous = anchors[ai.saturating_sub(1)].1;
+            let next = anchors[(bi + 1).min(anchors.len() - 1)].1;
+            for axis in 0..3 {
+                let start = a.root_position[axis];
+                let finish = b.root_position[axis];
+                let slope = (finish - start) / dt;
+                let mut v0 = (finish - previous.root_position[axis])
+                    / (record.time(b.frame, fps, override_fps)
+                        - record.time(previous.frame, fps, override_fps))
+                    .max(1e-6);
+                let mut v1 = (next.root_position[axis] - start)
+                    / (record.time(next.frame, fps, override_fps)
+                        - record.time(a.frame, fps, override_fps))
+                    .max(1e-6);
+                if slope.abs() < 1e-9 {
+                    v0 = 0.0;
+                    v1 = 0.0;
+                } else {
+                    let mut alpha = (v0 / slope).max(0.0);
+                    let mut beta = (v1 / slope).max(0.0);
+                    let norm = alpha.hypot(beta);
+                    if norm > 3.0 {
+                        alpha *= 3.0 / norm;
+                        beta *= 3.0 / norm;
+                    }
+                    v0 = alpha * slope;
+                    v1 = beta * slope;
+                }
+                result.root_position[axis] = ((2.0 * t.powi(3) - 3.0 * t * t + 1.0) * start
+                    + (t.powi(3) - 2.0 * t * t + t) * dt * v0
+                    + (-2.0 * t.powi(3) + 3.0 * t * t) * finish
+                    + (t.powi(3) - t * t) * dt * v1)
+                    .clamp(start.min(finish), start.max(finish));
+            }
+        }
+        result.hands.clear();
+        for items in &hand_anchors {
+            if items.is_empty() {
+                continue;
+            }
+            let (a, b) = bracket(items, frame);
+            let t = amount(record, items[a].0, items[b].0, frame, fps, override_fps);
+            let mut hand = items[a].1.clone();
+            for i in 0..21 {
+                hand.bone_rotations_xyzw[i] = blend_rotation(
+                    items[a].1.bone_rotations_xyzw[i],
+                    items[b].1.bone_rotations_xyzw[i],
+                    t,
+                )?;
+            }
+            result.prediction.hands |= items[a].0 != frame;
+            result.hands.push(hand);
+        }
+        if !head_anchors.is_empty() {
+            let (a, b) = bracket(&head_anchors, frame);
+            let t = amount(
+                record,
+                head_anchors[a].0,
+                head_anchors[b].0,
+                frame,
+                fps,
+                override_fps,
+            );
+            let mut head = head_anchors[a].1.clone();
+            head.orientation_xyzw = blend_rotation(
+                head_anchors[a].1.orientation_xyzw,
+                head_anchors[b].1.orientation_xyzw,
+                t,
+            )?;
+            result.head = Some(head);
+            result.prediction.head = head_anchors[a].0 != frame;
+        }
+        frames.push(result);
+    }
+    // Leading frames have no earlier observation: nearest-pose hold, explicitly predicted.
+    if first > 0 {
+        let mut leading = Vec::new();
+        for frame in 0..first {
+            let mut pose = frames[0].clone();
+            pose.frame = frame;
+            pose.prediction = Prediction {
+                body: true,
+                hands: !pose.hands.is_empty(),
+                head: pose.head.is_some(),
+            };
+            leading.push(pose);
+        }
+        leading.extend(frames);
+        frames = leading;
+    }
+    Ok(Subject {
+        subject_segment: reference.subject_segment,
+        person,
+        frames,
+    })
+}
+
+fn trimmed_range(
+    record: &Recording,
+    first: u64,
+    end: u64,
+    fps: f64,
+    override_fps: bool,
+    start: f64,
+    tail: f64,
+) -> Result<(u64, u64)> {
+    let origin = record.time(first, fps, override_fps);
+    let finish = record.time(end - 1, fps, override_fps) + 1.0 / fps;
+    ensure!(
+        finish - origin > start + tail,
+        "Recording is too short for a {start}s start/{tail}s end trim. Record longer or set --trim-start 0 --trim-end 0."
+    );
+    let begin = (first..end)
+        .find(|&f| record.time(f, fps, override_fps) >= origin + start)
+        .unwrap_or(end);
+    let end = (begin..end)
+        .find(|&f| record.time(f, fps, override_fps) >= finish - tail)
+        .unwrap_or(end);
+    ensure!(end > begin, "Trim leaves no frames");
+    Ok((begin, end))
+}
+
 pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
     ensure!(
         !options.no_display || options.output.is_some(),
@@ -591,16 +841,46 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
         fps.is_finite() && fps > 0.0 && fps <= 1000.0,
         "Replay FPS must be in (0,1000]"
     );
-    let (first, mut end) = playback_range(&record, &subjects, options.subject.is_some());
+    let (first, end) = playback_range(&record, &subjects, options.subject.is_some());
+    let start = options
+        .trim_start
+        .or(record.recording.as_ref().map(|t| t.trim_start_seconds))
+        .unwrap_or(3.0);
+    let tail = options
+        .trim_end
+        .or(record.recording.as_ref().map(|t| t.trim_end_seconds))
+        .unwrap_or(3.0);
+    let trim_origin = record.time(first, fps, options.fps.is_some()) + start;
+    let trim_finish = record.time(end - 1, fps, options.fps.is_some()) + 1.0 / fps - tail;
+    let (first, mut end) =
+        trimmed_range(&record, first, end, fps, options.fps.is_some(), start, tail)?;
+    let mut continuous = complete_motion(&record, &subjects, fps, options.fps.is_some())?;
     if let Some(limit) = options.max_frames {
         end = end.min(first.saturating_add(limit));
     }
     ensure!(end > first, "Replay timeline is empty");
+    continuous
+        .frames
+        .retain(|f| f.frame >= first && f.frame < end);
+    eprintln!(
+        "Replay continuity: {} frames, {} interpolated/held body poses",
+        continuous.frames.len(),
+        continuous
+            .frames
+            .iter()
+            .filter(|f| f.prediction.body)
+            .count()
+    );
+    let subjects = vec![&continuous];
     let follow_bounds = bounds(&record, &subjects, true)?;
     let world_bounds = bounds(&record, &subjects, false)?;
     let time = |f| record.time(f, fps, options.fps.is_some());
-    let origin = time(first);
-    let duration = time(end - 1) - origin + 1.0 / fps;
+    let origin = trim_origin;
+    let duration = if options.max_frames.is_some() {
+        trim_finish.min(time(end - 1) + 1.0 / fps) - origin
+    } else {
+        trim_finish - origin
+    };
     if let Some(output) = options.output {
         if let Some(source) = record
             .recording
@@ -779,6 +1059,7 @@ mod tests {
             frames: Vec::new(),
         };
         let mut frame = Frame {
+            prediction: Prediction::default(),
             frame: 0,
             root_position: [2.0, 3.0, 4.0],
             root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
@@ -814,6 +1095,8 @@ mod tests {
                 frame_count: 3,
                 timestamps_seconds: vec![0.1, 0.2, 0.35],
                 source_video: None,
+                trim_start_seconds: 3.0,
+                trim_end_seconds: 3.0,
             }),
             subjects: Vec::new(),
         };
@@ -852,6 +1135,7 @@ mod tests {
     #[test]
     fn default_replay_keeps_full_capture_even_when_tracking_is_split() {
         let frame = |frame| Frame {
+            prediction: Prediction::default(),
             frame,
             root_position: [0.0; 3],
             root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
@@ -884,6 +1168,8 @@ mod tests {
                 frame_count: 333,
                 timestamps_seconds: (0..333).map(|i| i as f64 * 11.795 / 332.0).collect(),
                 source_video: None,
+                trim_start_seconds: 3.0,
+                trim_end_seconds: 3.0,
             }),
             subjects: vec![
                 subject(0, 0, 81),
@@ -917,6 +1203,7 @@ mod tests {
         let q = Q::from_euler_angles(0.6, 0.0, 0.0);
         let q = q.quaternion();
         let frame = Frame {
+            prediction: Prediction::default(),
             frame: 0,
             root_position: [0.0; 3],
             root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
@@ -935,5 +1222,142 @@ mod tests {
             assert!(((hands[0][i] - hands[0][HAND_PARENT[i]]).norm() - 0.02).abs() < 1e-12);
         }
         assert!(hands[0][4].z > hands[0][0].z);
+    }
+    fn continuity_fixture() -> Recording {
+        let frame = |frame, angle| Frame {
+            prediction: Prediction::default(),
+            frame,
+            root_position: [frame as f64 / 10.0, 0.0, 0.0],
+            root_orientation_xyzw: q_array(Q::from_euler_angles(0.0, angle, 0.0)),
+            joint_rotations: (0..17)
+                .map(|i| JointRotation {
+                    joint: format!("j{i}"),
+                    quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
+                })
+                .collect(),
+            hands: Vec::new(),
+            head: None,
+        };
+        let subject = |id, length, frames| Subject {
+            subject_segment: id,
+            person: Person {
+                rest_offsets: vec![[0.0, length, 0.0]; 17],
+                hands: BTreeMap::new(),
+            },
+            frames,
+        };
+        Recording {
+            schema_version: 1,
+            quaternion_convention: "xyzw_active_parent_local".into(),
+            joint_names: (0..17).map(|i| format!("j{i}")).collect(),
+            parents: (0..17)
+                .map(|i| if i == 0 { None } else { Some(0) })
+                .collect(),
+            recording: Some(Timing {
+                fps: 10.0,
+                frame_count: 100,
+                timestamps_seconds: (0..100)
+                    .map(|i| {
+                        if (10..=20).contains(&i) {
+                            1.0 + ((i - 10) as f64 / 10.0).powi(2)
+                        } else {
+                            i as f64 / 10.0
+                        }
+                    })
+                    .collect(),
+                source_video: None,
+                trim_start_seconds: 3.0,
+                trim_end_seconds: 3.0,
+            }),
+            subjects: vec![
+                subject(0, 1.0, vec![frame(0, 0.0), frame(10, 0.0)]),
+                subject(1, 2.0, vec![frame(20, std::f64::consts::FRAC_PI_2)]),
+            ],
+        }
+    }
+    #[test]
+    fn motion_completion_fills_all_gaps_using_time_and_preserves_one_body_shape() {
+        let record = continuity_fixture();
+        let selected: Vec<_> = record.subjects.iter().collect();
+        let completed = complete_motion(&record, &selected, 10.0, false).unwrap();
+        assert_eq!(completed.frames.len(), 100);
+        let middle = &completed.frames[15];
+        assert!(middle.prediction.body);
+        assert!((middle.root_position[0] - 1.25).abs() < 1e-9);
+        assert!(
+            (rotation(middle.root_orientation_xyzw).unwrap().angle()
+                - std::f64::consts::FRAC_PI_2 * 0.25)
+                .abs()
+                < 1e-9
+        );
+        assert!(!completed.frames[10].prediction.body);
+        assert_eq!(
+            completed.frames[99].root_position,
+            completed.frames[20].root_position
+        );
+        for frame in &completed.frames {
+            let positions = record.positions(&completed, frame, false).unwrap();
+            for i in 1..17 {
+                assert!(((positions[i] - positions[0]).norm() - 1.0).abs() < 1e-12);
+            }
+            assert!((0.0..=2.0).contains(&frame.root_position[0]));
+        }
+    }
+    #[test]
+    fn trim_removes_three_seconds_at_each_end_and_rejects_empty_clips() {
+        let record = continuity_fixture();
+        assert_eq!(
+            trimmed_range(&record, 0, 100, 10.0, false, 3.0, 3.0).unwrap(),
+            (30, 70)
+        );
+        assert!(trimmed_range(&record, 0, 50, 10.0, false, 3.0, 3.0).is_err());
+        assert_eq!(
+            trimmed_range(&record, 0, 50, 10.0, false, 0.0, 0.0).unwrap(),
+            (0, 50)
+        );
+    }
+    #[test]
+    fn independent_hand_and_head_gaps_are_interpolated_not_dropped() {
+        let mut record = continuity_fixture();
+        for subject in &mut record.subjects {
+            subject.person.hands.insert(
+                "left".into(),
+                HandShape {
+                    bone_lengths: vec![0.02; 21],
+                    measurement_count: 10,
+                },
+            );
+        }
+        for (subject, index, angle) in [(0, 0, 0.0), (1, 0, 1.0)] {
+            let q = q_array(Q::from_euler_angles(angle, 0.0, 0.0));
+            record.subjects[subject].frames[index].hands = vec![HandFrame {
+                side: "left".into(),
+                confidence: 0.9,
+                bone_rotations_xyzw: vec![q; 21],
+            }];
+            record.subjects[subject].frames[index].head = Some(HeadPose {
+                orientation_xyzw: q,
+                confidence: 0.9,
+                source: "test".into(),
+            });
+        }
+        let selected: Vec<_> = record.subjects.iter().collect();
+        let completed = complete_motion(&record, &selected, 10.0, false).unwrap();
+        let frame = &completed.frames[10];
+        assert!(!frame.prediction.body && frame.prediction.hands && frame.prediction.head);
+        assert_eq!(frame.hands.len(), 1);
+        assert!(
+            (rotation(frame.head.as_ref().unwrap().orientation_xyzw)
+                .unwrap()
+                .angle()
+                - 0.5)
+                .abs()
+                < 1e-9
+        );
+        let body = record.positions(&completed, frame, true).unwrap();
+        let hands = hand_positions(&completed, frame, &body).unwrap();
+        for i in 1..21 {
+            assert!(((hands[0][i] - hands[0][HAND_PARENT[i]]).norm() - 0.02).abs() < 1e-12);
+        }
     }
 }

@@ -35,7 +35,7 @@ pub struct HandFrame {
     /// Camera-space incoming-bone rotations, mapping +Y onto each bone direction.
     pub bone_rotations_xyzw: Vec<[f64; 4]>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HandShape {
     pub bone_lengths: Vec<f64>,
     pub measurement_count: u64,

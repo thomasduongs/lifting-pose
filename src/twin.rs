@@ -694,6 +694,8 @@ pub struct RecordingTiming {
     pub frame_count: u64,
     pub timestamps_seconds: Vec<f64>,
     pub source_video: Option<String>,
+    pub trim_start_seconds: f64,
+    pub trim_end_seconds: f64,
 }
 fn overlap(a: Bbox, b: Bbox) -> f32 {
     let intersection = ((a.x + a.width).min(b.x + b.width) - a.x.max(b.x)).max(0.0)

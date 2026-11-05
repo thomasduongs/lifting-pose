@@ -10,50 +10,61 @@ per-frame rotations, preserving bone lengths through forward kinematics.
 
 ## Record and replay a 3D twin
 
-Record your webcam into a new session directory:
+There is one reusable recording save and one reusable replay video:
+
+- **`output/recording.twin`** contains the current videos, timing, and skeletal twin.
+- **`output/replay.mp4`** contains the latest 3D replay.
+
+Every new recording replaces the previous save after processing succeeds. Every
+replay overwrites the previous replay video. No numbered session folders or
+permanent intermediate files are created.
+
+Record:
 
 ```sh
-cargo run --release -- --record output/session-01 --camera 0
+cargo run --release -- --record --camera 0
 ```
 
-The recording preview opens immediately after the camera is ready. Press **q**
-or **Esc** to stop recording; the app then processes the entire saved video and
-finalizes the twin. Capture runs without neural inference so model processing
-does not reduce capture frame rate. Analysis takes additional time after capture.
-Use a new session directory for each recording; existing session artifacts are
-not overwritten by record mode.
+Press **q** or **Esc** to stop capture and build the twin. Capture runs without
+neural inference; analysis takes place afterward. Video, metadata, and raw twin
+observations are kept in temporary storage, bundled into `recording.twin`, and
+cleaned up. The old save is replaced atomically only after the new one is complete;
+a failed or too-short recording leaves it intact.
 
-The session contains:
+The `.twin` file is a portable ZIP container. It includes the full source backup,
+the finished video trimmed by three seconds at each end, annotated preview,
+capture timing, and final person/frame parameters. These are archive entries,
+not separate permanent files. Optional JSON Lines data is also kept inside the save.
+You can extract the archive with a ZIP tool if you need the original footage.
 
-- `source.mp4`: unannotated footage (silent; at most one border row/column is
-  cropped when the source dimensions are odd, for MP4 encoding).
-- `capture.json`: reported capture FPS and per-frame timestamps.
-- `tracked.mp4`: annotated pose/twin preview.
-- `twin.json`: shared body dimensions, per-frame rotations, root estimates, and
-  recording timing used by replay.
-
-For a timed capture, add `--record-seconds 10`. A headless camera recording
-(`--no-display`) requires `--record-seconds` or `--max-frames`. Stop normally with
-q/Esc or the duration/frame limit so video and twin files can be finalized.
-Recording needs the same local model files as tracking.
-
-You can also import an existing video into a session and build its twin:
+Add `--record-seconds 10` for a timed capture. Headless capture (`--no-display`)
+requires a duration or frame limit. `--trim-start 0 --trim-end 0` disables trimming;
+clips of six seconds or less need a smaller trim. Recording requires the local
+pose models. Import an existing video into the same reusable save with:
 
 ```sh
-cargo run --release -- --record output/session-02 --input lifting.mp4 --no-display
+cargo run --release -- --record --input lifting.mp4 --no-display
 ```
 
-Replay the finalized 3D skeleton:
+Replay the current save:
 
 ```sh
-cargo run --release -- --replay output/session-01/twin.json
+cargo run --release -- --replay
 ```
 
-Replay reconstructs joint positions using the saved hierarchy, shared rest
-offsets, and quaternion forward kinematics. **No neural models, Python, camera,
-or original video are required for replay.** Recorded timestamps determine
-playback timing. Frames without a reliable saved pose show an empty scene;
-no poses are invented across tracking gaps.
+This overwrites `output/replay.mp4` and opens the interactive viewer. For export
+only, use `--replay --no-display`. Replay extracts only the twin parameters into
+a temporary directory; it needs no models, Python, camera, or extracted videos.
+Custom `.twin` paths are supported after `--record` or `--replay`; legacy standalone
+`twin.json` inputs also remain supported. `--output other.mp4` overrides the replay
+video destination. Record mode keeps all generated assets inside the save.
+
+Recorded times control replay. Missing body, head, and hand poses are completed
+from surrounding observations; rotations are interpolated while FK keeps shared
+bone lengths fixed. Bounded Hermite root motion avoids overshoot. With only one
+usable endpoint, the nearest pose is held. Gray parts and the "Predicted motion"
+label identify predictions. Long gaps remain uncertain, and synthesized frames
+are not fed back into dimension calibration.
 
 | Replay key | Action |
 | --- | --- |
@@ -69,9 +80,12 @@ no poses are invented across tracking gaps.
 | R | Reset view |
 | Q / Esc | Close replay |
 
-By default replay covers the **entire capture timeline**, including every saved
-tracking segment and gaps without reliable poses. It no longer trims to segment
-zero. Use `--replay-subject 1` to explicitly filter and trim to one segment.
+By default replay covers the capture timeline **minus three seconds at each end**,
+including all tracking segments and completed gaps in the retained portion. It
+uses one shared reference body shape (from the segment with most valid frames)
+and the best-supported hand shapes across the selected recording so segment
+boundaries cannot resize the skeleton. This assumes one continuing person;
+select a specific subject if the recording contains a real identity change. Use `--replay-subject 1` to explicitly filter and trim to one segment.
 Older files without timing default to 30 FPS; `--replay-fps 15` overrides timing.
 The 3D view includes the 17-joint body, an outlined head with a forward-direction
 cue, and 21 landmarks per reliably detected hand. It has no skin mesh or 3D toes.
@@ -81,7 +95,8 @@ landmarks providing aligned crops. Each subject stores shared hand bone lengths;
 each frame stores incoming-bone quaternions in camera coordinates. Replay attaches
 the palm and fingers to the fitted body wrist. Learned hand depth is registered
 to body model units using image scale, so these are not metric measurements.
-Low-confidence/unseen hands are omitted. `--no-hands` disables the additional
+Low-confidence/unseen hand observations are omitted from the raw twin data;
+replay interpolates hand gaps independently when usable hand observations exist. `--no-hands` disables the additional
 model while retaining RTMW's existing 2D hand landmarks. Very small or poorly
 observed hands may not yield a 3D result.
 
@@ -91,24 +106,10 @@ unavailable, replay uses the head's body-joint orientation. This is not a facial
 surface reconstruction or a measured neck rotation. Old recordings still load
 but need reprocessing for dedicated hand and face-orientation data.
 
-Reprocess a session without replacing its original results:
-
-```sh
-cargo run --release -- --input output/session-01/source.mp4 --no-display \
-  --output output/session-01/tracked-enhanced.mp4 \
-  --twin-output output/session-01/twin-enhanced.json
-```
-
-A `source.mp4` with adjacent `capture.json` reuses the original acquisition times,
-including when imported into another session. This preserves real capture timing
-instead of substituting the video's nominal FPS.
-
-Export a shareable video of the 3D replay without opening a window:
-
-```sh
-cargo run --release -- --replay output/session-01/twin.json \
-  --output output/session-01/replay3d.mp4 --no-display
-```
+Legacy folder recordings can still be processed directly using `--input`,
+`--output`, and `--twin-output`. A legacy `source.mp4` next to `capture.json`
+reuses its acquisition times. For new recordings, use the bundled workflow above
+to avoid creating separate files.
 
 Replay video exports use a 1024×768 oblique in-place view. Irregular capture
 timestamps are resampled to constant FPS for MP4. Remove `--no-display` to export
@@ -219,7 +220,9 @@ parameters. During capture, reliable new observations refine the shared person
 estimate. These revisions are provisional estimates of one body, not independent
 limb lengths per frame. On normal completion (including **q** / **Esc**), the app
 refits every saved observation against the **same final dimensions** and writes
-`output/twin.json`. Use `--twin-output path.json` to choose another destination.
+the `twin.json` entry inside `output/recording.twin` in record mode. Direct
+tracking without `--record` remains available for debugging and writes
+`output/twin.json`; `--twin-output path.json` overrides that debug destination.
 The destination is overwritten and its parent directories are created if needed.
 `--no-3d` disables both lifting and twin recording.
 
@@ -527,3 +530,6 @@ for the affine/SimCC pipeline and to the upstream project for model licensing.
 
 The additional head/hand implementation is in `src/details.rs`; the hand model
 interface follows the [official OpenCV Zoo example](https://github.com/opencv/opencv_zoo/tree/main/models/handpose_estimation_mediapipe).
+
+`src/bundle.rs` packages a recording as one atomically replaced `.twin` save and
+extracts only temporary twin data during replay.

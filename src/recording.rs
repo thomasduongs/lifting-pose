@@ -63,7 +63,13 @@ pub fn capture(
     );
     std::fs::create_dir_all(directory)?;
     let source = directory.join("source.mp4");
-    for name in ["source.mp4", "capture.json", "twin.json", "tracked.mp4"] {
+    for name in [
+        "source.mp4",
+        "capture.json",
+        "twin.json",
+        "tracked.mp4",
+        "recording.mp4",
+    ] {
         ensure!(
             !directory.join(name).exists(),
             "Session already contains {name}. Choose a new --record directory."
@@ -91,10 +97,7 @@ pub fn capture(
     let mut writer: Option<videoio::VideoWriter> = None;
     let mut timestamps_seconds = Vec::new();
     let mut start = None;
-    eprintln!(
-        "Recording to {}. Press q or Esc to stop and build the twin.",
-        source.display()
-    );
+    eprintln!("Recording. Press q or Esc to stop and build the twin.");
     loop {
         let mut frame = Mat::default();
         if !capture.read(&mut frame)? || frame.empty() {
@@ -185,4 +188,109 @@ pub fn capture(
         result.timestamps_seconds.len()
     );
     Ok(result)
+}
+
+/// Finished video, sampled in acquisition time. Full source.mp4 remains a backup.
+pub fn export_trimmed(capture: &Capture, output: &Path, head: f64, tail: f64) -> Result<()> {
+    let times = &capture.timestamps_seconds;
+    ensure!(!times.is_empty(), "No captured frames to trim");
+    let begin = times[0] + head;
+    let finish = times[times.len() - 1] + 1.0 / capture.fps - tail;
+    ensure!(
+        finish > begin,
+        "Recording is too short to trim {head}s from the start and {tail}s from the end. Use --trim-start 0 --trim-end 0 for short clips."
+    );
+    ensure!(
+        output != capture.source
+            && !(output.exists() && output.canonicalize()? == capture.source.canonicalize()?),
+        "Trim output must differ from source backup"
+    );
+    let mut reader = videoio::VideoCapture::from_file_def(&capture.source)?;
+    ensure!(reader.is_opened()?, "Cannot read source video for trimming");
+    let first = times.partition_point(|&t| t < begin).min(times.len() - 1);
+    let mut index = 0;
+    let mut frame = Mat::default();
+    for _ in 0..=first {
+        ensure!(
+            reader.read(&mut frame)? && !frame.empty(),
+            "Source video is shorter than capture metadata"
+        );
+    }
+    index += first;
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut writer = videoio::VideoWriter::new(
+        output,
+        videoio::VideoWriter::fourcc('m', 'p', '4', 'v')?,
+        capture.fps,
+        Size::new(frame.cols(), frame.rows()),
+        true,
+    )?;
+    ensure!(writer.is_opened()?, "Cannot create trimmed recording");
+    let count = ((finish - begin) * capture.fps - 1e-7).ceil() as u64;
+    for i in 0..count {
+        let time = begin + i as f64 / capture.fps;
+        while index + 1 < times.len() && times[index + 1] <= time {
+            ensure!(
+                reader.read(&mut frame)? && !frame.empty(),
+                "Source video is shorter than capture metadata"
+            );
+            index += 1;
+        }
+        writer.write(&frame)?;
+    }
+    writer.release()?;
+    reader.release()?;
+    eprintln!("Trimmed video: {:.2}s", count as f64 / capture.fps);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn finished_video_trims_both_ends_and_preserves_source() {
+        let directory =
+            std::env::temp_dir().join(format!("lifting-trim-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.mp4");
+        let output = directory.join("recording.mp4");
+        let mut writer = videoio::VideoWriter::new(
+            &source,
+            videoio::VideoWriter::fourcc('m', 'p', '4', 'v').unwrap(),
+            10.0,
+            Size::new(32, 32),
+            true,
+        )
+        .unwrap();
+        for i in 0..100 {
+            let frame = Mat::new_rows_cols_with_default(
+                32,
+                32,
+                opencv::core::CV_8UC3,
+                Scalar::all(i as f64 * 2.0),
+            )
+            .unwrap();
+            writer.write(&frame).unwrap();
+        }
+        writer.release().unwrap();
+        let capture = Capture {
+            source: source.clone(),
+            fps: 10.0,
+            timestamps_seconds: (0..100).map(|i| i as f64 / 10.0).collect(),
+        };
+        export_trimmed(&capture, &output, 3.0, 3.0).unwrap();
+        let mut reader = videoio::VideoCapture::from_file_def(&output).unwrap();
+        assert_eq!(reader.get(videoio::CAP_PROP_FRAME_COUNT).unwrap(), 40.0);
+        let mut frame = Mat::default();
+        reader.read(&mut frame).unwrap();
+        let value = frame.data_typed::<opencv::core::Vec3b>().unwrap()[0][0];
+        assert!((45..80).contains(&value));
+        reader.release().unwrap();
+        let reader = videoio::VideoCapture::from_file_def(&source).unwrap();
+        assert_eq!(reader.get(videoio::CAP_PROP_FRAME_COUNT).unwrap(), 100.0);
+        drop(reader);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

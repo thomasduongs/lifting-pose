@@ -1,4 +1,5 @@
 mod angles;
+mod bundle;
 mod details;
 mod detection_cache;
 mod detector;
@@ -36,14 +37,20 @@ use std::{
     about = "Closest-person body, hand and foot estimation with OpenCV (CPU)"
 )]
 struct Args {
-    /// Capture a new session (or import --input), then build its 3D twin.
-    #[arg(long, conflicts_with_all = ["replay", "no_3d"])]
+    /// Record into one reusable save file (default: output/recording.twin).
+    #[arg(long, num_args = 0..=1, default_missing_value = bundle::DEFAULT_SAVE, conflicts_with_all = ["replay", "no_3d", "output"])]
     record: Option<PathBuf>,
+    /// Remove this many seconds from the start (default: 3).
+    #[arg(long, value_parser = parse_nonnegative)]
+    trim_start: Option<f64>,
+    /// Remove this many seconds from the end (default: 3).
+    #[arg(long, value_parser = parse_nonnegative)]
+    trim_end: Option<f64>,
     /// Stop camera recording after this many seconds; otherwise q / Esc stops it.
     #[arg(long, requires = "record", value_parser = parse_positive)]
     record_seconds: Option<f64>,
-    /// Replay an exported skeletal twin without loading any neural models.
-    #[arg(long, conflicts_with_all = ["record", "input", "camera"])]
+    /// Replay the reusable save (or legacy twin JSON); overwrites output/replay.mp4.
+    #[arg(long, num_args = 0..=1, default_missing_value = bundle::DEFAULT_SAVE, conflicts_with_all = ["record", "input", "camera"])]
     replay: Option<PathBuf>,
     /// Replay only this subject segment; default replays the full recording.
     #[arg(long)]
@@ -111,6 +118,15 @@ struct Args {
     /// Stop after this many frames.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     max_frames: Option<u64>,
+}
+
+fn parse_nonnegative(value: &str) -> std::result::Result<f64, String> {
+    let value: f64 = value.parse().map_err(|_| "Expected a nonnegative number")?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err("Value must be finite and nonnegative".into())
+    }
 }
 
 fn parse_positive(value: &str) -> std::result::Result<f64, String> {
@@ -390,18 +406,61 @@ fn process(
 fn main() -> Result<()> {
     let mut args = Args::parse();
     if let Some(path) = &args.replay {
+        let output = args
+            .output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(bundle::DEFAULT_REPLAY));
+        ensure!(
+            output != *path
+                && !(output.exists() && output.canonicalize()? == path.canonicalize()?),
+            "Replay output must differ from recording save"
+        );
+        let unpacked = if bundle::is_bundle(path)? {
+            Some(bundle::open_for_replay(path)?)
+        } else {
+            None
+        };
+        let twin = unpacked
+            .as_ref()
+            .map(|(_, p)| p.as_path())
+            .unwrap_or(path.as_path());
         return replay::run(
-            path,
+            twin,
             replay::Options {
-                output: args.output.as_deref(),
+                output: Some(&output),
                 no_display: args.no_display,
                 subject: args.replay_subject,
                 fps: args.replay_fps,
                 max_frames: args.max_frames,
+                trim_start: args.trim_start,
+                trim_end: args.trim_end,
             },
         );
     }
-    let captured = if let Some(directory) = args.record.clone() {
+    let session_workspace = if args.record.is_some() {
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let captured = if let Some(target) = &args.record {
+        ensure!(
+            !target.is_dir(),
+            "--record now takes one .twin save file. Use --record by itself for output/recording.twin."
+        );
+        for input in args.input.iter().chain([
+            &args.model,
+            &args.motion_model,
+            &args.hand_model,
+            &args.detector_model,
+        ]) {
+            ensure!(
+                !(target.exists()
+                    && input.exists()
+                    && target.canonicalize()? == input.canonicalize()?),
+                "Recording save must differ from input/model files"
+            );
+        }
+        let directory = session_workspace.as_ref().unwrap().path();
         for path in [&args.model, &args.motion_model] {
             ensure!(
                 path.is_file(),
@@ -424,20 +483,25 @@ fn main() -> Result<()> {
             );
         }
         let captured = recording::capture(
-            &directory,
+            directory,
             args.input.as_deref(),
             args.camera.unwrap_or(0),
             args.no_display,
             args.record_seconds,
             args.max_frames,
         )?;
+        recording::export_trimmed(
+            &captured,
+            &directory.join("recording.mp4"),
+            args.trim_start.unwrap_or(3.0),
+            args.trim_end.unwrap_or(3.0),
+        )?;
         args.input = Some(captured.source.clone());
         args.camera = None;
-        if args.twin_output == PathBuf::from("output/twin.json") {
-            args.twin_output = directory.join("twin.json");
-        }
-        if args.output.is_none() {
-            args.output = Some(directory.join("tracked.mp4"));
+        args.twin_output = directory.join("twin.json");
+        args.output = Some(directory.join("tracked.mp4"));
+        if args.json.is_some() {
+            args.json = Some(directory.join("poses.jsonl"));
         }
         // The recording preview already closed. Analyze every saved frame without a second window.
         args.no_display = true;
@@ -686,14 +750,21 @@ fn main() -> Result<()> {
             frame_count: timestamps_seconds.len() as u64,
             timestamps_seconds,
             source_video,
+            trim_start_seconds: args.trim_start.unwrap_or(3.0),
+            trim_end_seconds: args.trim_end.unwrap_or(3.0),
         });
         twin_recorder.save(&args.twin_output)?;
-        eprintln!("Saved skeletal twin: {}", args.twin_output.display());
-        if args.record.is_some() {
-            eprintln!(
-                "Replay with: cargo run --release -- --replay {}",
-                args.twin_output.display()
-            );
+        if args.record.is_none() {
+            eprintln!("Saved skeletal twin: {}", args.twin_output.display());
+        }
+        if let Some(target) = &args.record {
+            bundle::save(session_workspace.as_ref().unwrap().path(), target)?;
+            eprintln!("Replaced recording save: {}", target.display());
+            if target == std::path::Path::new(bundle::DEFAULT_SAVE) {
+                eprintln!("Replay with: cargo run --release -- --replay");
+            } else {
+                eprintln!("Replay using --replay with this save: {}", target.display());
+            }
         }
     }
     Ok(())
