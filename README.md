@@ -28,9 +28,34 @@ camera; it does not measure depth and can be affected by body size, posture, or
 occlusion. Detection confidence breaks ties between equally sized boxes.
 
 Use `--bbox x,y,width,height` to bypass detection with a fixed manual crop, or
-`--no-detection` to estimate one full-frame pose. Detection runs independently on
-every frame, so the selected person can change when someone else has a larger
-box. Persistent identity tracking and lifting form analysis are not implemented.
+`--no-detection` to estimate one full-frame pose. Detection runs on the first
+frame and every **15 frames** thereafter by default. Between refreshes, the last
+selected bounding box is reused while pose estimation and angles update every
+frame. The selected person can change at a refresh when someone else has a larger
+box. Empty detections are also cached until the next refresh; resolution changes
+force immediate detection. A moving person can leave the cached crop between
+refreshes, so use a smaller interval for fast motion. Persistent identity tracking and lifting form analysis are not implemented.
+
+Joint angles are displayed automatically beside the selected person's joints.
+Yellow labels show left/right shoulder, elbow, wrist, hip, knee, and ankle angles
+in degrees, when their landmarks are reliable. These are unsigned **2D interior
+angles** (0–180°) measured in the image plane: a straight joint is 180°, not 0°.
+Perspective and camera angle affect the measurements; these are not 3D joint
+rotations or anatomical flexion/extension measurements.
+
+| Angle (each side) | Landmark triplet (middle landmark is the vertex) |
+| --- | --- |
+| Shoulder | Elbow → shoulder → hip |
+| Elbow | Shoulder → elbow → wrist |
+| Wrist | Elbow → wrist → first middle-finger joint |
+| Hip | Shoulder → hip → knee |
+| Knee | Hip → knee → ankle |
+| Ankle | Knee → ankle → big toe |
+
+Wrist and ankle measurements require the whole-body model. Ankle angles use the
+ankle-to-big-toe direction as a foot approximation. All three landmarks must be
+inside the frame and meet `--threshold`; missing, low-confidence, or coincident
+landmarks produce no label and a JSON `degrees: null` value.
 
 ## Setup
 
@@ -99,12 +124,17 @@ Webcam preview with automatic detection (press **q** or **Esc** to stop):
 cargo run --release -- --camera 0
 ```
 
-Adjust person detection confidence and duplicate suppression:
+Adjust detection frequency, confidence, and duplicate suppression:
 
 ```sh
-cargo run --release -- --camera 0 --detection-threshold 0.5 \
+cargo run --release -- --camera 0 --detection-interval 15 --detection-threshold 0.5 \
   --nms-threshold 0.45
 ```
+
+`--detection-interval 1` restores detection on every frame. Higher intervals reduce
+average detector cost but delay crop updates and switching to a closer person.
+Still images always run detection once. `--bbox` and `--no-detection` bypass the
+schedule.
 
 The detection threshold uses objectness × person-class confidence (default 0.4).
 NMS uses bounding-box intersection-over-union (default 0.45). These settings are
@@ -137,11 +167,15 @@ audio is not copied. Webcam capture may require camera permission for your termi
 
 `--threshold 0.3` controls skeleton visibility. Each JSON Lines record includes a
 zero-based frame index, frame dimensions, total inference time in milliseconds,
-and a `people` array with zero or one entry. The selected person has a zero-based `person_index` valid only for
+`detection_ran` (whether the detector ran on that frame), and a `people` array with zero or one entry. The selected person has a zero-based `person_index` valid only for
 that frame, a `bbox` (`x`, `y`, `width`, `height`), a `detection_score`, and a
-`keypoints` array with `name`, `x`, `y`, `score` per point. All keypoints are
+`keypoints` array with `name`, `x`, `y`, `score` per point. Each person also has an
+`angles` array of 12 objects such as `{"joint":"left_knee","degrees":124.5}`;
+unavailable angles have `degrees: null`. All keypoints are
 exported, including low-scoring ones. Frames without detections emit `people: []`
-and skip pose inference. Manual/full-frame crops have `detection_score: null`.
+and skip pose inference. On cached frames, `bbox` and `detection_score` come from
+the last refresh; keypoints and angles are newly calculated. Manual/full-frame
+crops have `detection_score: null` and `detection_ran: false`.
 This replaces the previous top-level `keypoints` field with per-person results.
 Coordinates
 refer to the original frame and may lie outside its bounds; invalid nonpositive
@@ -159,6 +193,8 @@ cargo test
 - `src/pose.rs`: padded aspect-preserving affine crop, RGB mean/std normalization,
   NCHW blob, OpenCV DNN CPU inference, SimCC argmax decoding, inverse crop mapping,
   and COCO skeleton rendering.
+- `src/detection_cache.rs`: periodic detector scheduling and selected-crop caching.
+- `src/angles.rs`: confidence-gated 2D joint angle calculations and degree labels.
 - `src/detector.rs`: YOLOX-s RGB letterbox preprocessing, person-class decoding,
   coordinate rescaling/clipping, non-maximum suppression, and closest-person selection. Based on the
   [official OpenCV Zoo inference implementation](https://github.com/opencv/opencv_zoo/tree/main/models/object_detection_yolox).

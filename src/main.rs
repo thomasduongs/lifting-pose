@@ -1,9 +1,12 @@
+mod angles;
+mod detection_cache;
 mod detector;
 mod landmarks;
 mod pose;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
+use detection_cache::DetectionCache;
 use detector::PersonDetector;
 use opencv::{
     core::{Mat, Point, Rect, Scalar, Size, Vector},
@@ -34,6 +37,9 @@ struct Args {
     /// Skip detection and estimate one full-frame pose.
     #[arg(long, conflicts_with = "bbox")]
     no_detection: bool,
+    /// Run person detection every N frames; reuse the selected crop between refreshes.
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
+    detection_interval: u64,
     /// Minimum person detection confidence (objectness × class score).
     #[arg(long, default_value_t = 0.4, value_parser = parse_probability)]
     detection_threshold: f32,
@@ -116,6 +122,7 @@ struct PersonPose {
     /// Null for manual/full-frame crops.
     detection_score: Option<f32>,
     keypoints: Vec<Keypoint>,
+    angles: Vec<angles::JointAngle>,
 }
 
 #[derive(Serialize)]
@@ -124,6 +131,7 @@ struct FramePose<'a> {
     width: i32,
     height: i32,
     inference_ms: f64,
+    detection_ran: bool,
     people: &'a [PersonPose],
 }
 
@@ -131,15 +139,20 @@ fn process(
     frame: &mut Mat,
     estimator: &mut PoseEstimator,
     detector: &mut Option<PersonDetector>,
+    detection_cache: &mut DetectionCache,
     args: &Args,
     index: u64,
     json: &mut Option<BufWriter<File>>,
 ) -> Result<()> {
     let start = Instant::now();
+    let mut detection_ran = false;
     let crops = if let Some(detector) = detector {
-        detector
-            .detect(frame, args.detection_threshold, args.nms_threshold)?
-            .into_iter()
+        detection_ran = detection_cache.update(index, frame.size()?, || {
+            detector.detect(frame, args.detection_threshold, args.nms_threshold)
+        })?;
+        detection_cache
+            .detections()
+            .iter()
             .map(|d| (d.bbox, Some(d.score)))
             .collect::<Vec<_>>()
     } else {
@@ -162,11 +175,17 @@ fn process(
     let mut people = Vec::with_capacity(crops.len());
     for (person_index, (bbox, detection_score)) in crops.into_iter().enumerate() {
         let keypoints = estimator.infer(frame, bbox)?;
+        let angles = angles::calculate(
+            &keypoints,
+            args.threshold,
+            Size::new(frame.cols(), frame.rows()),
+        );
         people.push(PersonPose {
             person_index,
             bbox,
             detection_score,
             keypoints,
+            angles,
         });
     }
     let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -178,6 +197,7 @@ fn process(
                 width: frame.cols(),
                 height: frame.rows(),
                 inference_ms,
+                detection_ran,
                 people: &people,
             },
         )?;
@@ -214,6 +234,9 @@ fn process(
             imgproc::LINE_AA,
             false,
         )?;
+    }
+    for person in &people {
+        angles::draw(frame, &person.keypoints, &person.angles)?;
     }
     if index == 0 || index.is_multiple_of(30) {
         eprintln!(
@@ -255,6 +278,7 @@ fn main() -> Result<()> {
     } else {
         Some(PersonDetector::new(&args.detector_model)?)
     };
+    let mut detection_cache = DetectionCache::new(args.detection_interval);
     let mut json = args
         .json
         .as_ref()
@@ -279,6 +303,7 @@ fn main() -> Result<()> {
             &mut image,
             &mut estimator,
             &mut detector,
+            &mut detection_cache,
             &args,
             0,
             &mut json,
@@ -320,6 +345,7 @@ fn main() -> Result<()> {
                 &mut frame,
                 &mut estimator,
                 &mut detector,
+                &mut detection_cache,
                 &args,
                 index,
                 &mut json,
