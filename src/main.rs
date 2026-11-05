@@ -8,6 +8,7 @@ mod motion3d;
 mod pose;
 mod recording;
 mod replay;
+mod scope;
 mod tracking;
 mod twin;
 
@@ -37,6 +38,9 @@ use std::{
     about = "Closest-person body, hand and foot estimation with OpenCV (CPU)"
 )]
 struct Args {
+    /// Restore full-body tracking; default focuses on the visible upper body.
+    #[arg(long)]
+    full_body: bool,
     /// Record into one reusable save file (default: output/recording.twin).
     #[arg(long, num_args = 0..=1, default_missing_value = bundle::DEFAULT_SAVE, conflicts_with_all = ["replay", "no_3d", "output"])]
     record: Option<PathBuf>,
@@ -255,17 +259,20 @@ fn process(
     // Infer every crop from the original frame before adding any annotations.
     let mut people = Vec::with_capacity(crops.len());
     for (person_index, (bbox, detection_score)) in crops.into_iter().enumerate() {
-        let keypoints = estimator.infer(frame, bbox)?;
+        let mut keypoints = estimator.infer(frame, bbox)?;
+        if !args.full_body {
+            scope::mask_lower(&mut keypoints);
+        }
         let hands = match hand_model.as_mut() {
             Some(model) => model.infer(frame, &keypoints)?,
             None => Vec::new(),
         };
         let head = details::head_pose(&keypoints, args.threshold);
-        let angles = angles::calculate(
-            &keypoints,
-            args.threshold,
-            Size::new(frame.cols(), frame.rows()),
-        );
+        let angles = if args.full_body {
+            angles::calculate(&keypoints, args.threshold, frame.size()?)
+        } else {
+            angles::calculate_scoped(&keypoints, args.threshold, frame.size()?, true)
+        };
         let pose3d = match lifter.as_mut() {
             Some(lifter) => lifter.infer(&keypoints, bbox, frame.size()?, args.threshold)?,
             None => None,
@@ -434,6 +441,7 @@ fn main() -> Result<()> {
                 max_frames: args.max_frames,
                 trim_start: args.trim_start,
                 trim_end: args.trim_end,
+                full_body: args.full_body,
             },
         );
     }
@@ -573,7 +581,11 @@ fn main() -> Result<()> {
         Some(details::HandModel::new(&args.hand_model)?)
     };
     let mut twin_recorder = twin::TwinRecorder::default();
+    if let Some(lifter) = lifter.as_mut() {
+        lifter.set_upper_body(!args.full_body);
+    }
     let mut dimension_tracker = tracking::DimensionTracker::default();
+    dimension_tracker.set_upper_body(!args.full_body);
     let mut json = args
         .json
         .as_ref()
@@ -752,6 +764,7 @@ fn main() -> Result<()> {
             source_video,
             trim_start_seconds: args.trim_start.unwrap_or(3.0),
             trim_end_seconds: args.trim_end.unwrap_or(3.0),
+            upper_body: !args.full_body,
         });
         twin_recorder.save(&args.twin_output)?;
         if args.record.is_none() {

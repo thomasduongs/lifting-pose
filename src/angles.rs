@@ -117,6 +117,14 @@ fn interior_angle(a: &Keypoint, b: &Keypoint, c: &Keypoint) -> Option<f64> {
 }
 
 pub fn calculate(points: &[Keypoint], threshold: f32, size: Size) -> Vec<JointAngle> {
+    calculate_scoped(points, threshold, size, false)
+}
+pub fn calculate_scoped(
+    points: &[Keypoint],
+    threshold: f32,
+    size: Size,
+    upper_body: bool,
+) -> Vec<JointAngle> {
     let usable = |p: &&Keypoint| {
         p.score.is_finite()
             && p.score > 0.0
@@ -130,8 +138,21 @@ pub fn calculate(points: &[Keypoint], threshold: f32, size: Size) -> Vec<JointAn
     };
     JOINTS
         .iter()
+        .filter(|joint| {
+            !upper_body
+                || !(joint.name.contains("hip")
+                    || joint.name.contains("knee")
+                    || joint.name.contains("ankle"))
+        })
         .map(|joint| {
-            let [a, b, c] = joint.points.map(|index| points.get(index).filter(usable));
+            let mut indices = joint.points;
+            if upper_body && joint.name == "left_shoulder" {
+                indices = [7, 5, 6];
+            }
+            if upper_body && joint.name == "right_shoulder" {
+                indices = [8, 6, 5];
+            }
+            let [a, b, c] = indices.map(|index| points.get(index).filter(usable));
             let degrees = match (a, b, c) {
                 (Some(a), Some(b), Some(c)) => interior_angle(a, b, c),
                 _ => None,

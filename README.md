@@ -8,6 +8,30 @@ separate ONNX Runtime installation is required.
 A skeletal twin fits the 3D observations using shared body dimensions and
 per-frame rotations, preserving bone lengths through forward kinematics.
 
+## Upper-body focus (default)
+
+Tracking now focuses on the visible **head, neck, shoulders, arms, wrists, and
+hands**. Both shoulders must be reliable, but hips and legs are not required.
+The overlay and 3D replay omit the pelvis, hips, knees, ankles, and feet, and the
+viewer frames the upper body without a ground grid. Older recordings also replay
+in upper-body view by default.
+
+The 3D lifting network still has a 17-joint interface. Neutral lower-body context
+is supplied internally with **zero confidence**; those slots are not treated as
+observations, used to calibrate lower-body dimensions, or used to move the crop.
+Upper-body IK is anchored at the chest and uses the shoulder/head reference frame,
+so changing hidden leg/spine scaffold lengths cannot move the fitted visible joints.
+Upper-body saves identify their active joints and omit unobserved pelvis/leg
+measurements from their named person parameters. Compatibility rest-offset slots
+remain in the file, but are not leg measurements.
+
+Angles shown in this mode are shoulder, elbow, and wrist angles. The 2D shoulder
+reference is the opposite shoulder; the 3D reference is the chest. Hip, knee, and
+ankle angles are omitted. Head and 3D hand tracking remain enabled. Add
+`--full-body` when recording/tracking to restore the full-body pipeline later.
+An upper-body-only save cannot turn its hidden slots into measured legs merely
+by passing `--full-body` to replay.
+
 ## Record and replay a 3D twin
 
 There is one reusable recording save and one reusable replay video:
@@ -533,3 +557,5 @@ interface follows the [official OpenCV Zoo example](https://github.com/opencv/op
 
 `src/bundle.rs` packages a recording as one atomically replaced `.twin` save and
 extracts only temporary twin data during replay.
+
+`src/scope.rs` defines active upper-body landmarks and suppresses lower-body observations.

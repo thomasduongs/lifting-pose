@@ -41,6 +41,8 @@ struct Timing {
     trim_start_seconds: f64,
     #[serde(default = "default_trim")]
     trim_end_seconds: f64,
+    #[serde(default)]
+    upper_body: bool,
 }
 #[derive(Clone, Deserialize)]
 struct Subject {
@@ -87,6 +89,7 @@ pub struct Options<'a> {
     pub max_frames: Option<u64>,
     pub trim_start: Option<f64>,
     pub trim_end: Option<f64>,
+    pub full_body: bool,
 }
 
 fn default_trim() -> f64 {
@@ -273,19 +276,47 @@ fn hand_positions(subject: &Subject, frame: &Frame, body: &[V; N]) -> Result<Vec
     Ok(result)
 }
 
+fn display_positions(
+    record: &Recording,
+    subject: &Subject,
+    frame: &Frame,
+    follow: bool,
+    upper: bool,
+) -> Result<[V; N]> {
+    let mut positions = record.positions(subject, frame, follow)?;
+    if follow && upper {
+        let chest = positions[8];
+        for p in &mut positions {
+            *p -= chest;
+        }
+    }
+    Ok(positions)
+}
+
 struct Bounds {
     center: V,
     radius: f64,
     floor: f64,
 }
-fn bounds(record: &Recording, subjects: &[&Subject], follow: bool) -> Result<Bounds> {
+fn bounds(
+    record: &Recording,
+    subjects: &[&Subject],
+    follow: bool,
+    upper_body: bool,
+) -> Result<Bounds> {
     let mut min = V::repeat(f64::INFINITY);
     let mut max = V::repeat(f64::NEG_INFINITY);
     for subject in subjects {
         for frame in &subject.frames {
-            for p in record.positions(subject, frame, follow)? {
-                min = min.inf(&p);
-                max = max.sup(&p);
+            for (i, p) in display_positions(record, subject, frame, follow, upper_body)?
+                .iter()
+                .enumerate()
+            {
+                if upper_body && !crate::scope::body_upper(i) {
+                    continue;
+                }
+                min = min.inf(p);
+                max = max.sup(p);
             }
         }
     }
@@ -301,6 +332,7 @@ struct View {
     zoom: f64,
     follow: bool,
     names: bool,
+    upper_body: bool,
 }
 impl Default for View {
     fn default() -> Self {
@@ -310,6 +342,7 @@ impl Default for View {
             zoom: 1.0,
             follow: true,
             names: false,
+            upper_body: true,
         }
     }
 }
@@ -345,7 +378,7 @@ fn render(
             .then(|| Point::new(x.round() as i32, y.round() as i32))
     };
     // A visual reference plane; no physical ground/contact estimate is implied.
-    for i in -5..=5 {
+    for i in if view.upper_body { 0..0 } else { -5..6 } {
         let offset = i as f64 * scene.radius / 5.0;
         for (a, b) in [
             (
@@ -386,8 +419,14 @@ fn render(
             .map(|i| (*subject, &subject.frames[i]))
     });
     if let Some((subject, pose)) = current {
-        let positions = record.positions(subject, pose, view.follow)?;
+        let positions = display_positions(record, subject, pose, view.follow, view.upper_body)?;
         for i in 1..N {
+            if view.upper_body
+                && (!crate::scope::body_upper(i)
+                    || !crate::scope::body_upper(record.parents[i].unwrap()))
+            {
+                continue;
+            }
             let color = if pose.prediction.body {
                 Scalar::new(165.0, 165.0, 165.0, 0.0)
             } else if record.joint_names[i].starts_with("left_") {
@@ -465,6 +504,9 @@ fn render(
             }
         }
         for (i, p) in positions.iter().enumerate() {
+            if view.upper_body && !crate::scope::body_upper(i) {
+                continue;
+            }
             if let Some(p) = project(*p) {
                 imgproc::circle(
                     &mut image,
@@ -872,8 +914,13 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
             .count()
     );
     let subjects = vec![&continuous];
-    let follow_bounds = bounds(&record, &subjects, true)?;
-    let world_bounds = bounds(&record, &subjects, false)?;
+    let upper_body = !options.full_body || record.recording.as_ref().is_some_and(|t| t.upper_body);
+    let follow_bounds = bounds(&record, &subjects, true, upper_body)?;
+    let world_bounds = bounds(&record, &subjects, false, upper_body)?;
+    let default_view = View {
+        upper_body,
+        ..View::default()
+    };
     let time = |f| record.time(f, fps, options.fps.is_some());
     let origin = trim_origin;
     let duration = if options.max_frames.is_some() {
@@ -922,7 +969,7 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
                 &subjects,
                 cursor,
                 &follow_bounds,
-                &View::default(),
+                &default_view,
                 seconds,
                 1.0,
                 false,
@@ -935,7 +982,7 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
         return Ok(());
     }
     let mut cursor = first;
-    let mut view = View::default();
+    let mut view = default_view;
     let mut paused = false;
     let mut speed = 1.0;
     let mut deadline = Instant::now();
@@ -997,7 +1044,12 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
                 view.yaw = -0.55;
                 view.pitch = 0.12;
             }
-            114 => view = View::default(),
+            114 => {
+                view = View {
+                    upper_body,
+                    ..View::default()
+                }
+            }
             91 => {
                 speed = (speed / 2.0).max(0.25);
                 deadline = Instant::now();
@@ -1097,6 +1149,7 @@ mod tests {
                 source_video: None,
                 trim_start_seconds: 3.0,
                 trim_end_seconds: 3.0,
+                upper_body: false,
             }),
             subjects: Vec::new(),
         };
@@ -1170,6 +1223,7 @@ mod tests {
                 source_video: None,
                 trim_start_seconds: 3.0,
                 trim_end_seconds: 3.0,
+                upper_body: false,
             }),
             subjects: vec![
                 subject(0, 0, 81),
@@ -1268,6 +1322,7 @@ mod tests {
                 source_video: None,
                 trim_start_seconds: 3.0,
                 trim_end_seconds: 3.0,
+                upper_body: false,
             }),
             subjects: vec![
                 subject(0, 1.0, vec![frame(0, 0.0), frame(10, 0.0)]),
@@ -1358,6 +1413,36 @@ mod tests {
         let hands = hand_positions(&completed, frame, &body).unwrap();
         for i in 1..21 {
             assert!(((hands[0][i] - hands[0][HAND_PARENT[i]]).norm() - 0.02).abs() < 1e-12);
+        }
+    }
+    #[test]
+    fn upper_body_camera_bounds_ignore_out_of_view_legs() {
+        let mut record = continuity_fixture();
+        let selected: Vec<_> = record.subjects.iter().collect();
+        let before = bounds(&record, &selected, true, true).unwrap();
+        for subject in &mut record.subjects {
+            for i in 1..7 {
+                subject.person.rest_offsets[i] = [1000.0, 1000.0, 1000.0];
+            }
+        }
+        let selected: Vec<_> = record.subjects.iter().collect();
+        let after = bounds(&record, &selected, true, true).unwrap();
+        assert!((before.center - after.center).norm() < 1e-12);
+        assert!((before.radius - after.radius).abs() < 1e-12);
+    }
+    #[test]
+    fn upper_body_follow_view_anchors_at_chest_without_distorting_arm_lengths() {
+        let record = continuity_fixture();
+        let subject = &record.subjects[0];
+        let frame = &subject.frames[0];
+        let original = record.positions(subject, frame, true).unwrap();
+        let visible = display_positions(&record, subject, frame, true, true).unwrap();
+        assert_eq!(visible[8], V::zeros());
+        for i in 8..17 {
+            assert!(
+                ((visible[i] - visible[8]).norm() - (original[i] - original[8]).norm()).abs()
+                    < 1e-12
+            );
         }
     }
 }

@@ -86,6 +86,7 @@ pub struct Pose3d {
 
 #[derive(Default)]
 struct History {
+    upper_body: bool,
     frames: VecDeque<PoseInput>,
     previous_coco: Option<PoseInput>,
     bbox: Option<Bbox>,
@@ -94,7 +95,11 @@ struct History {
 
 impl History {
     fn clear(&mut self) {
-        *self = Self::default();
+        let upper_body = self.upper_body;
+        *self = Self {
+            upper_body,
+            ..Self::default()
+        };
     }
 
     fn tensor(&self) -> Vec<f32> {
@@ -126,14 +131,17 @@ impl History {
                 && p.x < size.width as f32
                 && p.y < size.height as f32
         };
-        // One occluded shoulder/hip should not discard an otherwise usable body pose.
-        // Confidence remains low in the model input and in downstream calibration.
-        let torso = [5, 6, 11, 12];
+        let torso = if self.upper_body {
+            &[5, 6][..]
+        } else {
+            &[5, 6, 11, 12][..]
+        };
         let reliable = torso
             .iter()
             .filter(|&&i| valid(&points[i]) && points[i].score >= threshold)
             .count();
-        if reliable < 3
+        let needed = if self.upper_body { 2 } else { 3 };
+        if reliable < needed
             || (self.previous_coco.is_none() && torso.iter().any(|&i| !valid(&points[i])))
         {
             self.clear();
@@ -159,7 +167,30 @@ impl History {
                 coco[i] = [previous[i][0], previous[i][1], 0.0];
             }
         }
+        if self.upper_body {
+            let width = (points[5].x - points[6].x)
+                .hypot(points[5].y - points[6].y)
+                .max(20.0);
+            let cx = (points[5].x + points[6].x) / 2.0;
+            let cy = (points[5].y + points[6].y) / 2.0;
+            // Neutral low-confidence context required by the full-body lifting network.
+            for (i, dx, dy) in [
+                (11, 0.3, 1.0),
+                (12, -0.3, 1.0),
+                (13, 0.3, 2.0),
+                (14, -0.3, 2.0),
+                (15, 0.3, 3.0),
+                (16, -0.3, 3.0),
+            ] {
+                coco[i] = [cx + dx * width, cy + dy * width, 0.0];
+            }
+        }
         let mut converted = coco_to_h36m(coco);
+        if self.upper_body {
+            for p in &mut converted[..8] {
+                p[2] = 0.0;
+            }
+        }
         for p in &mut converted {
             p[0] = p[0] / size.width as f32 * 2.0 - 1.0;
             p[1] = p[1] / size.width as f32 * 2.0 - size.height as f32 / size.width as f32;
@@ -252,6 +283,11 @@ impl MotionLifter {
         })
     }
 
+    pub fn set_upper_body(&mut self, upper_body: bool) {
+        self.history.upper_body = upper_body;
+        self.history.clear();
+    }
+
     pub fn reset(&mut self) {
         self.history.clear();
     }
@@ -310,9 +346,14 @@ impl MotionLifter {
 }
 
 pub(crate) fn angles3d(joints: &[Joint3d], threshold: f32) -> Vec<JointAngle> {
+    let upper = joints[..8].iter().all(|p| p.input_score == 0.0);
     ANGLES
         .iter()
-        .map(|&(joint, [a, b, c])| {
+        .filter(|(name, _)| !upper || !(name.contains("hip") || name.contains("knee")))
+        .map(|&(joint, [a, b, mut c])| {
+            if upper && joint.contains("shoulder") {
+                c = 8;
+            }
             let (a, b, c) = (&joints[a], &joints[b], &joints[c]);
             let u = [
                 f64::from(a.x - b.x),
@@ -361,18 +402,25 @@ pub fn draw(image: &mut Mat, pose: &Pose3d) -> Result<()> {
         imgproc::LINE_8,
         0,
     )?;
+    let upper = pose.joints[..8].iter().all(|p| p.input_score == 0.0);
     let projected: Vec<_> = pose
         .joints
         .iter()
         .map(|j| (j.x + 0.5 * j.z, j.y - 0.3 * j.z))
         .collect();
-    let minx = projected.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
-    let maxx = projected
+    let visible: Vec<_> = projected
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !upper || crate::scope::body_upper(*i))
+        .map(|(_, p)| *p)
+        .collect();
+    let minx = visible.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+    let maxx = visible
         .iter()
         .map(|p| p.0)
         .fold(f32::NEG_INFINITY, f32::max);
-    let miny = projected.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
-    let maxy = projected
+    let miny = visible.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+    let maxy = visible
         .iter()
         .map(|p| p.1)
         .fold(f32::NEG_INFINITY, f32::max);
@@ -389,9 +437,15 @@ pub fn draw(image: &mut Mat, pose: &Pose3d) -> Result<()> {
     };
     let color = Scalar::new(255.0, 210.0, 70.0, 0.0);
     for (a, b) in BONES {
+        if upper && (!crate::scope::body_upper(a) || !crate::scope::body_upper(b)) {
+            continue;
+        }
         imgproc::line(image, pixel(a), pixel(b), color, 2, imgproc::LINE_AA, 0)?;
     }
     for i in 0..JOINTS {
+        if upper && !crate::scope::body_upper(i) {
+            continue;
+        }
         imgproc::circle(image, pixel(i), 3, color, -1, imgproc::LINE_AA, 0)?;
     }
     imgproc::put_text(
@@ -506,6 +560,27 @@ mod tests {
         assert_eq!(history.frames.len(), 2);
         assert_eq!(history.frames.back().unwrap()[11][2], 0.1);
         p[6].score = 0.1;
+        assert!(!history.push(&p, bbox(), Size::new(640, 480), 0.3));
+    }
+    #[test]
+    fn upper_body_history_does_not_require_or_trust_hips_and_legs() {
+        let mut history = History {
+            upper_body: true,
+            ..History::default()
+        };
+        let mut p = points();
+        crate::scope::mask_lower(&mut p);
+        assert!(history.push(&p, bbox(), Size::new(640, 480), 0.3));
+        assert!(
+            history.frames.back().unwrap()[..8]
+                .iter()
+                .all(|p| p[2] == 0.0)
+        );
+        assert!(history.frames.back().unwrap()[11][2] > 0.0);
+        history.clear();
+        assert!(history.upper_body);
+        assert!(history.push(&p, bbox(), Size::new(640, 480), 0.3));
+        p[5].score = 0.1;
         assert!(!history.push(&p, bbox(), Size::new(640, 480), 0.3));
     }
 }

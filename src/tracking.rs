@@ -47,6 +47,7 @@ pub struct TrackingResult {
 }
 #[derive(Default)]
 pub struct DimensionTracker {
+    upper_body: bool,
     subject: Option<usize>,
     missing: [u8; 17],
 }
@@ -64,6 +65,10 @@ fn reliable(p: &Keypoint, threshold: f32, size: Size) -> bool {
 }
 
 impl DimensionTracker {
+    pub fn set_upper_body(&mut self, upper: bool) {
+        self.upper_body = upper;
+        self.missing = [0; 17];
+    }
     pub fn refine(
         &mut self,
         raw: &[Keypoint],
@@ -96,11 +101,15 @@ impl DimensionTracker {
             adjustments: Vec::new(),
             next_crop: None,
         };
-        let projection =
-            projection.filter(|p| projection_agrees_with_torso(raw, p, bbox, size, threshold));
+        let projection = projection.filter(|p| {
+            projection_agrees_with_torso(raw, p, bbox, size, threshold, self.upper_body)
+        });
         if let Some(projected) = projection {
             result.dimension_prior_active = true;
             for (h, c) in BODY {
+                if self.upper_body && !crate::scope::coco_upper(c) {
+                    continue;
+                }
                 let Some(p) = raw.get(c) else {
                     continue;
                 };
@@ -140,11 +149,13 @@ impl DimensionTracker {
                     }
                 }
             }
-            result.next_crop = following_crop(raw, &projected, bbox, size, threshold);
+            result.next_crop =
+                following_crop(raw, &projected, bbox, size, threshold, self.upper_body);
         } else {
             self.missing = [0; 17];
         }
-        result.angles = angles::calculate(&result.keypoints, threshold, size);
+        result.angles =
+            angles::calculate_scoped(&result.keypoints, threshold, size, self.upper_body);
         result
     }
 }
@@ -155,9 +166,15 @@ fn projection_agrees_with_torso(
     bbox: Bbox,
     size: Size,
     threshold: f32,
+    upper_body: bool,
 ) -> bool {
     let mut errors = Vec::new();
-    for (h, c) in [(11, 5), (14, 6), (4, 11), (1, 12)] {
+    let anchors = if upper_body {
+        &[(11, 5), (14, 6), (12, 7), (15, 8)][..]
+    } else {
+        &[(11, 5), (14, 6), (4, 11), (1, 12)][..]
+    };
+    for &(h, c) in anchors {
         if let Some(raw) = raw
             .get(c)
             .filter(|point| reliable(point, threshold.max(0.6), size))
@@ -165,7 +182,7 @@ fn projection_agrees_with_torso(
             errors.push((raw.x - p[h][0]).hypot(raw.y - p[h][1]));
         }
     }
-    if errors.len() < 3 || bbox.width <= 0.0 || bbox.height <= 0.0 {
+    if errors.len() < if upper_body { 2 } else { 3 } || bbox.width <= 0.0 || bbox.height <= 0.0 {
         return false;
     }
     errors.sort_by(f32::total_cmp);
@@ -179,15 +196,21 @@ fn following_crop(
     old: Bbox,
     size: Size,
     threshold: f32,
+    upper_body: bool,
 ) -> Option<Bbox> {
     let mut coordinates: Vec<_> = projected
         .iter()
-        .copied()
+        .enumerate()
+        .filter(|(i, _)| !upper_body || crate::scope::body_upper(*i))
+        .map(|(_, p)| *p)
         .filter(|p| in_frame(p[0], p[1], size))
         .collect();
     for (index, p) in raw.iter().enumerate() {
         // Preserve observed head/hand/foot reach; detailed face points do not drive the crop.
-        if (23..91).contains(&index) || !reliable(p, threshold.max(0.65), size) {
+        if (upper_body && !crate::scope::coco_upper(index))
+            || (23..91).contains(&index)
+            || !reliable(p, threshold.max(0.65), size)
+        {
             continue;
         }
         if p.x >= old.x - old.width * 0.25
@@ -359,7 +382,7 @@ mod tests {
         let result =
             DimensionTracker::default().refine_projection(&raw, Some(bad), bbox, size, 0.3);
         assert!(!result.dimension_prior_active && result.next_crop.is_none());
-        let crop = following_crop(&raw, &p, bbox, size, 0.3).unwrap();
+        let crop = following_crop(&raw, &p, bbox, size, 0.3, false).unwrap();
         assert!(
             crop.x >= 0.0
                 && crop.y >= 0.0

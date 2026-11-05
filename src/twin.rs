@@ -157,14 +157,24 @@ impl Estimate {
 }
 
 struct Calibration {
+    upper_body: bool,
     estimates: [Estimate; 10],
     revision: u64,
     frames: u64,
 }
 impl Calibration {
     fn new(obs: &Observation) -> Self {
-        let raw = measurements(&obs.points, &[1.0; N], 0.0);
-        let scale = (obs.points[8] - obs.points[0]).norm().max(0.05);
+        let upper_body = is_upper(obs);
+        let raw = if upper_body {
+            measurements(&obs.points, &obs.scores, 0.1)
+        } else {
+            measurements(&obs.points, &[1.0; N], 0.0)
+        };
+        let scale = if upper_body {
+            (obs.points[11] - obs.points[14]).norm().max(0.05)
+        } else {
+            (obs.points[8] - obs.points[0]).norm().max(0.05)
+        };
         let fallback = [
             scale * 0.6,
             scale * 0.9,
@@ -186,6 +196,7 @@ impl Calibration {
             Estimate::new(value.max(1e-4))
         });
         Self {
+            upper_body,
             estimates,
             revision: 0,
             frames: 0,
@@ -226,14 +237,26 @@ impl Calibration {
         PersonParameters {
             units: "motionagformer_model_units",
             revision: self.revision,
-            pelvis_width: dimensions.0[0],
+            pelvis_width: (!self.upper_body).then_some(dimensions.0[0]),
+            body_scope: if self.upper_body {
+                "upper_body"
+            } else {
+                "full_body"
+            },
+            active_joint_indices: (0..N)
+                .filter(|&i| !self.upper_body || crate::scope::body_upper(i))
+                .collect(),
             shoulder_width: dimensions.0[1],
-            segment_lengths: (2..10).map(|i| (DIMENSIONS[i], dimensions.0[i])).collect(),
+            segment_lengths: (2..10)
+                .filter(|i| !self.upper_body || [4, 5, 8, 9].contains(i))
+                .map(|i| (DIMENSIONS[i], dimensions.0[i]))
+                .collect(),
             rest_offsets: dimensions.offsets().map(array),
             bilateral_symmetry: true,
             calibration_frames: self.frames,
             hands: BTreeMap::new(),
             measurement_counts: (0..10)
+                .filter(|i| !self.upper_body || [1, 4, 5, 8, 9].contains(i))
                 .map(|i| (DIMENSIONS[i], self.estimates[i].samples))
                 .collect(),
         }
@@ -244,7 +267,10 @@ impl Calibration {
 pub struct PersonParameters {
     units: &'static str,
     revision: u64,
-    pelvis_width: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pelvis_width: Option<f64>,
+    body_scope: &'static str,
+    active_joint_indices: Vec<usize>,
     shoulder_width: f64,
     segment_lengths: BTreeMap<&'static str, f64>,
     /// These offsets are shared by all frames of the finalized subject.
@@ -268,6 +294,16 @@ struct Observation {
     history_frames: usize,
     hands: Vec<HandPose>,
     head: Option<HeadPose>,
+}
+
+fn is_upper(obs: &Observation) -> bool {
+    obs.scores[..8].iter().all(|s| *s == 0.0) && obs.scores[8] > 0.0
+}
+fn align_upper_anchor(dimensions: Dimensions, pose: &mut Pose, obs: &Observation) {
+    if is_upper(obs) {
+        pose.root = V::zeros();
+        pose.root = obs.points[8] - forward(dimensions, pose).0[8];
+    }
 }
 
 fn descendant(mut node: usize, ancestor: usize) -> bool {
@@ -312,8 +348,16 @@ fn quaternion(q: Q) -> [f64; 4] {
 }
 
 fn root_orientation(obs: &Observation) -> Q {
-    let x = obs.points[4] - obs.points[1];
-    let down = obs.points[0] - obs.points[8];
+    let x = if is_upper(obs) {
+        obs.points[11] - obs.points[14]
+    } else {
+        obs.points[4] - obs.points[1]
+    };
+    let down = if is_upper(obs) {
+        obs.points[8] - obs.points[10]
+    } else {
+        obs.points[0] - obs.points[8]
+    };
     if x.norm() < 1e-6 || down.norm() < 1e-6 {
         return Q::identity();
     }
@@ -335,6 +379,9 @@ fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
         ..Pose::default()
     };
     for node in 1..N {
+        if is_upper(obs) && node < 8 {
+            continue;
+        }
         if let Some(child) = ((node + 1)..N).find(|&i| PARENT[i] == node && obs.scores[i] > 0.0) {
             let (positions, world) = forward(dimensions, &pose);
             let from = positions[child] - positions[node];
@@ -350,19 +397,31 @@ fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
 /// Block coordinate damped least-squares IK with analytic rotational Jacobians.
 /// Each step changes rotations only: dimensions remain fixed for the entire solve.
 fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -> Pose {
-    let initialized = initial_pose(dimensions, obs);
-    let delta = dimensions.0[2] * 0.2;
+    let mut initialized = initial_pose(dimensions, obs);
+    align_upper_anchor(dimensions, &mut initialized, obs);
+    let scale = if is_upper(obs) {
+        dimensions.0[4]
+    } else {
+        dimensions.0[2]
+    };
+    let delta = scale * 0.2;
+    let mut previous = previous.cloned();
+    if let Some(p) = previous.as_mut() {
+        align_upper_anchor(dimensions, p, obs);
+    }
     let mut pose = match previous {
         Some(previous)
-            if cost(&forward(dimensions, previous).0, obs, delta)
+            if cost(&forward(dimensions, &previous).0, obs, delta)
                 < cost(&forward(dimensions, &initialized).0, obs, delta) =>
         {
-            previous.clone()
+            previous
         }
         _ => initialized,
     };
-    pose.root = V::zeros();
-    let damping = dimensions.0[2].powi(2) * 0.002;
+    if !is_upper(obs) {
+        pose.root = V::zeros();
+    }
+    let damping = scale.powi(2) * 0.002;
     for _ in 0..8 {
         let before = cost(&forward(dimensions, &pose).0, obs, delta);
         for node in (0..N).rev() {
@@ -376,7 +435,12 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
                 if !descendant(i, node) || obs.scores[i] <= 0.0 {
                     continue;
                 }
-                let arm = positions[i] - positions[node];
+                let pivot = if is_upper(obs) && (node == 0 || node == 7) {
+                    positions[8]
+                } else {
+                    positions[node]
+                };
+                let arm = positions[i] - pivot;
                 let residual = obs.points[i] - positions[i];
                 let weight = obs.scores[i].powi(2) * robust_weight(residual.norm(), delta);
                 // delta_position = delta_rotation × arm.
@@ -404,6 +468,7 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
                     candidate.local[node] =
                         unit(world[PARENT[node]].inverse() * rotation * world[node]);
                 }
+                align_upper_anchor(dimensions, &mut candidate, obs);
                 if cost(&forward(dimensions, &candidate).0, obs, delta) < old_cost {
                     pose = candidate;
                     break;
@@ -433,6 +498,7 @@ pub struct FrameParameters {
     root_translation_model: &'static str,
     focal_length_px: f64,
     focal_length_assumed: bool,
+    image_scale_px_per_unit: Option<f64>,
     fit_rmse: f64,
     angles: Vec<crate::angles::JointAngle>,
     hands: Vec<HandFrame>,
@@ -499,7 +565,7 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
     let translation = camera_translation(obs, &positions);
     FrameParameters {
         frame: obs.frame,
-        root_position: array(translation.unwrap_or(V::zeros())),
+        root_position: array(translation.map(|t| t + pose.root).unwrap_or(V::zeros())),
         root_orientation_xyzw: quaternion(pose.orientation),
         joint_rotations: (0..N)
             .map(|i| JointRotation {
@@ -511,6 +577,7 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
         root_translation_model: "weak_perspective_approximation",
         focal_length_px: obs.focal,
         focal_length_assumed: obs.assumed_focal,
+        image_scale_px_per_unit: translation.map(|t| obs.focal / t.z),
         fit_rmse,
         angles: motion3d::angles3d(&fitted_joints, 0.0),
         hands: Vec::new(),
@@ -534,12 +601,19 @@ impl TwinPreview {
         if self.person.calibration_frames < 5 || !self.frame.root_translation_valid {
             return None;
         }
-        let leg = self.person.segment_lengths["upper_leg"];
+        let leg = self.person.segment_lengths[if self.person.body_scope == "upper_body" {
+            "upper_arm"
+        } else {
+            "upper_leg"
+        }];
         if self.frame.fit_rmse > leg * 0.3 {
             return None;
         }
         let root = self.frame.root_position;
-        let scale = self.frame.focal_length_px / root[2];
+        let scale = self
+            .frame
+            .image_scale_px_per_unit
+            .unwrap_or(self.frame.focal_length_px / root[2]);
         if !scale.is_finite() || scale <= 0.0 {
             return None;
         }
@@ -586,8 +660,11 @@ fn registered_vectors(hand: &HandPose, frame: &FrameParameters) -> Option<[V; 21
             + p.y * f64::from(hand.image_landmarks[i][1] - hand.image_landmarks[0][1]);
         denominator += p.x * p.x + p.y * p.y;
     }
-    let scale =
-        numerator / denominator.max(1e-12) / (frame.focal_length_px / frame.root_position[2]);
+    let scale = numerator
+        / denominator.max(1e-12)
+        / frame
+            .image_scale_px_per_unit
+            .unwrap_or(frame.focal_length_px / frame.root_position[2]);
     if !scale.is_finite() || !(0.001..100.0).contains(&scale) {
         return None;
     }
@@ -696,6 +773,7 @@ pub struct RecordingTiming {
     pub source_video: Option<String>,
     pub trim_start_seconds: f64,
     pub trim_end_seconds: f64,
+    pub upper_body: bool,
 }
 fn overlap(a: Bbox, b: Bbox) -> f32 {
     let intersection = ((a.x + a.width).min(b.x + b.width) - a.x.max(b.x)).max(0.0)
@@ -798,9 +876,9 @@ impl TwinRecorder {
         let joints: Vec<_> = (0..N)
             .map(|i| Joint3d {
                 name: motion3d::NAMES[i],
-                x: fitted[i].x as f32,
-                y: fitted[i].y as f32,
-                z: fitted[i].z as f32,
+                x: (fitted[i].x - solved.root.x) as f32,
+                y: (fitted[i].y - solved.root.y) as f32,
+                z: (fitted[i].z - solved.root.z) as f32,
                 input_score: pose.joints[i].input_score,
             })
             .collect();
@@ -1120,5 +1198,48 @@ mod tests {
             }
             previous = Some(fitted);
         }
+    }
+    #[test]
+    fn upper_body_fit_and_calibration_ignore_hidden_lower_body_geometry() {
+        let mut obs = observation(0, &pose());
+        for i in 0..8 {
+            obs.scores[i] = 0.0;
+            obs.pixel_scores[i] = 0.0;
+        }
+        let mut calibration = Calibration::new(&obs);
+        for _ in 0..40 {
+            calibration.update(&obs, 0.6);
+        }
+        let person = serde_json::to_value(calibration.parameters()).unwrap();
+        assert_eq!(person["body_scope"], "upper_body");
+        assert!(person.get("pelvis_width").is_none());
+        assert!(person["segment_lengths"].get("upper_leg").is_none());
+        assert!(person["measurement_counts"].get("lower_leg").is_none());
+        let original = dimensions();
+        let mut altered = original;
+        altered.0[0] *= 4.0;
+        altered.0[2] *= 10.0;
+        altered.0[3] *= 10.0;
+        altered.0[6] *= 3.0;
+        altered.0[7] *= 3.0;
+        let a = inverse(original, &obs, None);
+        let b = inverse(altered, &obs, None);
+        let pa = forward(original, &a).0;
+        let pb = forward(altered, &b).0;
+        assert!((pa[8] - obs.points[8]).norm() < 1e-12);
+        assert!((pb[8] - obs.points[8]).norm() < 1e-12);
+        for i in 8..17 {
+            assert!(
+                (pa[i] - pb[i]).norm() < 1e-6,
+                "Hidden dimensions changed visible joint {i}"
+            );
+        }
+        let frame = frame_parameters(original, &obs, &a);
+        assert!(
+            frame
+                .angles
+                .iter()
+                .all(|a| !a.joint.contains("hip") && !a.joint.contains("knee"))
+        );
     }
 }
