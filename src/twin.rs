@@ -66,6 +66,7 @@ struct Pose {
     root: V,
     orientation: Q,
     local: [Q; N],
+    camera: Option<V>,
 }
 impl Default for Pose {
     fn default() -> Self {
@@ -74,6 +75,7 @@ impl Default for Pose {
             root: V::zeros(),
             orientation: Q::identity(),
             local: [Q::identity(); N],
+            camera: None,
         }
     }
 }
@@ -294,6 +296,7 @@ struct Observation {
     frame: u64,
     time_seconds: f64,
     direct_depth: bool,
+    assume_upright_torso: bool,
     points: [V; N],
     scores: [f64; N],
     pixels: [[f64; 2]; N],
@@ -600,6 +603,26 @@ fn root_orientation(obs: &Observation) -> Q {
     ])))
 }
 
+/// Remove unobservable torso lean while preserving the chest's world rotation.
+/// Node 8 still controls the shoulder girdle/neck, so arms and head remain free.
+fn constrain_upright_torso(pose: &mut Pose, upper_body: bool) {
+    let chest = unit(pose.orientation * pose.local[7] * pose.local[8]);
+    let right = if upper_body {
+        chest * V::x()
+    } else {
+        pose.orientation * V::x()
+    };
+    let heading = if right.x.hypot(right.z) > 1e-8 {
+        (-right.z).atan2(right.x)
+    } else {
+        let old = pose.orientation * V::x();
+        (-old.z).atan2(old.x)
+    };
+    pose.orientation = Q::from_axis_angle(&V::y_axis(), heading);
+    pose.local[7] = Q::identity();
+    pose.local[8] = unit(pose.orientation.inverse() * chest);
+}
+
 fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
     let mut pose = Pose {
         time_seconds: obs.time_seconds,
@@ -622,6 +645,9 @@ fn initial_pose(dimensions: Dimensions, obs: &Observation) -> Pose {
             }
         }
     }
+    if obs.assume_upright_torso {
+        constrain_upright_torso(&mut pose, is_upper(obs));
+    }
     pose
 }
 
@@ -643,6 +669,21 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
         previous = None;
     }
     if let Some(p) = previous.as_mut() {
+        if obs.direct_depth && is_upper(obs) && obs.scores[11].min(obs.scores[14]) >= 0.5 {
+            let observed = obs.points[11] - obs.points[14];
+            let before = forward(dimensions, p).0;
+            let old = before[11] - before[14];
+            if observed.x.hypot(observed.z) > 1e-6 && old.x.hypot(old.z) > 1e-6 {
+                let difference = (-observed.z).atan2(observed.x) - (-old.z).atan2(old.x);
+                let yaw = difference.sin().atan2(difference.cos());
+                // Missing limbs should follow the measured torso turn, not resist
+                // it by staying fixed in camera coordinates.
+                p.orientation = unit(Q::from_axis_angle(&V::y_axis(), yaw) * p.orientation);
+            }
+        }
+        if obs.assume_upright_torso {
+            constrain_upright_torso(p, is_upper(obs));
+        }
         align_upper_anchor(dimensions, p, obs);
     }
     let dt = previous
@@ -654,7 +695,7 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
         obs,
         delta,
         camera: if obs.direct_depth {
-            fit_camera(obs, &obs.points)
+            fit_camera_seeded(obs, &obs.points, previous.as_ref().and_then(|p| p.camera))
         } else {
             None
         },
@@ -688,6 +729,9 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
     for _ in 0..12 {
         let before = context.cost(&forward(dimensions, &pose).0);
         for node in (0..N).rev() {
+            if obs.assume_upright_torso && (node == 7 || (is_upper(obs) && node == 0)) {
+                continue;
+            }
             if !(1..N).any(|i| descendant(i, node)) {
                 continue;
             }
@@ -734,6 +778,9 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
             let Some(mut step) = a.lu().solve(&b) else {
                 continue;
             };
+            if obs.assume_upright_torso && node == 0 {
+                step = V::new(0.0, b.y / a[(1, 1)].max(1e-12), 0.0);
+            }
             if step.norm() > 0.3 {
                 step *= 0.3 / step.norm();
             }
@@ -753,6 +800,9 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
                 if obs.direct_depth {
                     limit_bends(&mut candidate);
                 }
+                if obs.assume_upright_torso {
+                    constrain_upright_torso(&mut candidate, is_upper(obs));
+                }
                 align_upper_anchor(dimensions, &mut candidate, obs);
                 if context.cost(&forward(dimensions, &candidate).0) < old_cost {
                     pose = candidate;
@@ -766,6 +816,11 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
         }
     }
     pose.time_seconds = obs.time_seconds;
+    pose.camera = if obs.direct_depth {
+        fit_camera_seeded(obs, &forward(dimensions, &pose).0, context.camera)
+    } else {
+        None
+    };
     pose
 }
 
@@ -1080,6 +1135,7 @@ fn inverse_with_size(
 pub struct JointRotation {
     joint: &'static str,
     quaternion_xyzw: [f64; 4],
+    confidence: f64,
 }
 #[derive(Serialize)]
 pub struct FrameParameters {
@@ -1139,8 +1195,12 @@ fn camera_translation(obs: &Observation, positions: &[V; N]) -> Option<V> {
     );
     root.iter().all(|v| v.is_finite()).then_some(root)
 }
+#[cfg(test)]
 fn fit_camera(obs: &Observation, positions: &[V; N]) -> Option<V> {
-    let mut camera = camera_translation(obs, positions)?;
+    fit_camera_seeded(obs, positions, None)
+}
+fn fit_camera_seeded(obs: &Observation, positions: &[V; N], seed: Option<V>) -> Option<V> {
+    let mut camera = camera_translation(obs, positions).or(seed)?;
     if !obs.direct_depth {
         return Some(camera);
     }
@@ -1221,7 +1281,7 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
         .sum::<f64>()
         / sum.max(1e-9))
     .sqrt();
-    let translation = fit_camera(obs, &positions);
+    let translation = fit_camera_seeded(obs, &positions, pose.camera);
     let reprojection_rmse_px = translation.and_then(|camera| {
         let mut sum = 0.0;
         let mut weights = 0.0;
@@ -1242,6 +1302,7 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
             .map(|i| JointRotation {
                 joint: motion3d::NAMES[i],
                 quaternion_xyzw: quaternion(pose.local[i]),
+                confidence: obs.scores[i],
             })
             .collect(),
         root_translation_valid: translation.is_some(),
@@ -1468,6 +1529,7 @@ pub struct TwinRecorder {
     last_bbox: Option<Bbox>,
     last_size: Option<Size>,
     recording: Option<RecordingTiming>,
+    free_torso: bool,
 }
 
 #[derive(Serialize)]
@@ -1479,6 +1541,7 @@ pub struct RecordingTiming {
     pub trim_start_seconds: f64,
     pub trim_end_seconds: f64,
     pub upper_body: bool,
+    pub assume_upright_torso: bool,
 }
 fn overlap(a: Bbox, b: Bbox) -> f32 {
     let intersection = ((a.x + a.width).min(b.x + b.width) - a.x.max(b.x)).max(0.0)
@@ -1486,6 +1549,9 @@ fn overlap(a: Bbox, b: Bbox) -> f32 {
     intersection / (a.width * a.height + b.width * b.height - intersection).max(f32::EPSILON)
 }
 impl TwinRecorder {
+    pub fn set_upright_torso(&mut self, assume: bool) {
+        self.free_torso = !assume;
+    }
     pub fn set_timing(&mut self, recording: RecordingTiming) {
         self.recording = Some(recording);
     }
@@ -1515,6 +1581,7 @@ impl TwinRecorder {
             frame,
             time_seconds,
             direct_depth: pose.model == "MediaPipe-Pose",
+            assume_upright_torso: !self.free_torso,
             points: std::array::from_fn(|i| {
                 V::new(
                     pose.joints[i].x as f64,
@@ -1552,7 +1619,8 @@ impl TwinRecorder {
             head,
         };
         if obs.points.iter().any(|p| !p.iter().all(|x| x.is_finite()))
-            || obs.scores.iter().filter(|&&s| s > 0.0).count() < 4
+            || (obs.scores.iter().filter(|&&s| s > 0.0).count() < 4
+                && !(is_upper(&obs) && obs.scores[11].min(obs.scores[14]) >= 0.5))
         {
             return None;
         }
@@ -1687,6 +1755,7 @@ mod tests {
             frame,
             time_seconds: frame as f64 / 30.0,
             direct_depth: false,
+            assume_upright_torso: false,
             points: positions,
             scores: [0.9; N],
             pixels: positions.map(|p| [320.0 + p.x * 500.0, 240.0 + p.y * 500.0]),
@@ -1709,6 +1778,162 @@ mod tests {
         p.local[11] = Q::from_euler_angles(0.3, 0.1, 0.8);
         p.local[12] = Q::from_euler_angles(0.7, 0.0, 0.2);
         p
+    }
+    #[test]
+    fn upright_spin_tracks_a_full_turn_with_only_shoulders_during_the_back_view() {
+        let mut previous = None;
+        let mut last = None;
+        let mut unwrapped = 0.0;
+        for i in 0..=72 {
+            let angle = -(i as f64) * std::f64::consts::TAU / 72.0;
+            let truth = Pose {
+                orientation: Q::from_axis_angle(&V::y_axis(), angle),
+                ..Pose::default()
+            };
+            let mut obs = observation(i, &truth);
+            obs.direct_depth = true;
+            obs.assume_upright_torso = true;
+            obs.scores[..8].fill(0.0);
+            obs.pixel_scores[..8].fill(0.0);
+            if (11..62).contains(&i) {
+                obs.scores.fill(0.0);
+                obs.pixel_scores.fill(0.0);
+                for j in [8, 11, 14] {
+                    obs.scores[j] = 0.9;
+                    obs.pixel_scores[j] = 0.9;
+                }
+            }
+            for j in 0..N {
+                obs.pixels[j] = project(obs.points[j], V::new(0.12, -0.08, 2.4), &obs)
+                    .unwrap()
+                    .0
+                    .into();
+            }
+            let fitted = inverse(dimensions(), &obs, previous.as_ref());
+            let right = fitted.orientation * V::x();
+            let heading = (-right.z).atan2(right.x);
+            assert!(
+                (heading - angle).sin().atan2((heading - angle).cos()).abs() < 0.12,
+                "Frame {i}: lost heading"
+            );
+            if let Some(old) = last {
+                let delta: f64 = heading - old;
+                unwrapped += delta.sin().atan2(delta.cos());
+            }
+            last = Some(heading);
+            assert!((fitted.orientation * V::y() - V::y()).norm() < 1e-10);
+            assert!(
+                fitted.camera.is_some(),
+                "Lost camera estimate at profile frame {i}"
+            );
+            previous = Some(fitted);
+        }
+        assert!((unwrapped + std::f64::consts::TAU).abs() < 0.15);
+    }
+    #[test]
+    fn shoulder_only_observations_are_kept_without_face_or_hand_landmarks() {
+        let mut source = observation(0, &Pose::default());
+        source.scores.fill(0.0);
+        for i in [8, 11, 14] {
+            source.scores[i] = 0.9;
+        }
+        let pose = Pose3d {
+            model: "MediaPipe-Pose",
+            coordinate_space: "root_relative_camera",
+            units: "estimated_meters",
+            history_frames: 1,
+            joints: (0..N)
+                .map(|i| Joint3d {
+                    name: motion3d::NAMES[i],
+                    x: source.points[i].x as f32,
+                    y: source.points[i].y as f32,
+                    z: source.points[i].z as f32,
+                    input_score: source.scores[i] as f32,
+                })
+                .collect(),
+            angles: Vec::new(),
+        };
+        let mut points = vec![
+            Keypoint {
+                name: "unseen",
+                x: -1.0,
+                y: -1.0,
+                score: 0.0
+            };
+            17
+        ];
+        for (c, h) in [(5, 11), (6, 14)] {
+            points[c] = Keypoint {
+                name: "shoulder",
+                x: source.pixels[h][0] as f32,
+                y: source.pixels[h][1] as f32,
+                score: 0.9,
+            };
+        }
+        let mut recorder = TwinRecorder::default();
+        assert!(
+            recorder
+                .observe(
+                    0,
+                    0.0,
+                    &pose,
+                    &points,
+                    &[],
+                    None,
+                    Bbox {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 640.0,
+                        height: 480.0
+                    },
+                    source.size,
+                    0.3,
+                    Some(source.focal)
+                )
+                .is_some()
+        );
+    }
+    #[test]
+    fn upright_torso_keeps_spine_vertical_without_moving_upper_body_observations() {
+        let dimensions = dimensions();
+        let mut p = pose();
+        p.local[7] = Q::from_euler_angles(0.25, 0.1, -0.15);
+        p.local[8] = Q::from_euler_angles(-0.1, 0.2, 0.12);
+        let before = forward(dimensions, &p).0;
+        constrain_upright_torso(&mut p, true);
+        let chest = forward(dimensions, &p).0[8];
+        p.root += before[8] - chest;
+        let after = forward(dimensions, &p).0;
+        assert!((p.orientation * V::y() - V::y()).norm() < 1e-12);
+        for i in [7, 8] {
+            assert!((after[i] - after[0]).x.abs() < 1e-12);
+            assert!((after[i] - after[0]).z.abs() < 1e-12);
+        }
+        for i in 8..N {
+            assert!(
+                (after[i] - before[i]).norm() < 1e-12,
+                "Upper joint {i} moved"
+            );
+        }
+        for i in 1..N {
+            assert!(
+                ((after[i] - after[PARENT[i]]).norm() - dimensions.offsets()[i].norm()).abs()
+                    < 1e-12
+            );
+        }
+    }
+    #[test]
+    fn upright_constraint_survives_ik_updates_and_a_tilted_previous_pose() {
+        let mut obs = observation(1, &pose());
+        obs.scores[..8].fill(0.0);
+        obs.pixel_scores[..8].fill(0.0);
+        obs.assume_upright_torso = true;
+        let fit = inverse(dimensions(), &obs, Some(&pose()));
+        let positions = forward(dimensions(), &fit).0;
+        assert!((fit.orientation * V::y() - V::y()).norm() < 1e-12);
+        assert!(fit.local[7].angle() < 1e-12);
+        assert!((positions[8] - positions[0]).cross(&V::y()).norm() < 1e-12);
+        assert!((positions[8] - obs.points[8]).norm() < 1e-12);
     }
     #[test]
     fn perspective_camera_and_projection_jacobian_match_known_geometry() {

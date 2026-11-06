@@ -81,6 +81,27 @@ cargo run --release -- --record --camera 0 --model models/rtmw-m.onnx
 
 ## Upper-body focus (default)
 
+The torso spine is **assumed upright by default**. Pelvis-to-spine-to-chest bones
+stay vertical relative to the replay floor; torso forward/back and side lean are
+not estimated. Turning is allowed. Shoulder-girdle/neck and arm rotations remain
+free, so the upright constraint does not force the observed head or hands into a
+neutral pose. The assumption is recorded as `assume_upright_torso` in timing
+metadata. Use `--free-torso` on a new tracking/recording run to allow lean again.
+This is an imposed reference, not a measured gravity/camera calibration.
+In upright upper-body mode, body yaw is assigned to the root from the fitted
+shoulder direction; the chest joint cannot absorb the whole turn while the body
+root stays facing forward. Reliable shoulders can sustain tracking when the face
+and hands disappear in a back view. The motion prior follows measured torso yaw,
+carrying unobserved limb poses in body-relative coordinates. Camera fitting reuses
+the previous translation as an initialization at narrow profile views.
+
+Saved joint rotations include their observation `confidence`; replay dims joints
+with little 3D observation support. These are model confidences, not calibrated
+angle uncertainties. Missing hand/head orientations are interpolated relative to
+the turning body and converted back to camera coordinates; measured orientations
+remain unchanged. This keeps inferred detail from staying camera-facing through a spin.
+
+
 Tracking now focuses on the visible **head, neck, shoulders, arms, wrists, and
 hands**. Both shoulders must be reliable, but hips and legs are not required.
 The 3D inset and replay still display the full skeleton. Unobserved lower-body

@@ -45,6 +45,9 @@ struct Args {
     /// Restore full-body tracking; default focuses on the visible upper body.
     #[arg(long)]
     full_body: bool,
+    /// Allow torso lean while fitting new poses; the default assumes an upright spine.
+    #[arg(long)]
+    free_torso: bool,
     /// Record into one reusable save file (default: output/recording.twin).
     #[arg(long, num_args = 0..=1, default_missing_value = bundle::DEFAULT_SAVE, conflicts_with_all = ["replay", "no_3d", "output"])]
     record: Option<PathBuf>,
@@ -673,6 +676,7 @@ fn main() -> Result<()> {
         Some(details::HandModel::new(&args.hand_model)?)
     };
     let mut twin_recorder = twin::TwinRecorder::default();
+    twin_recorder.set_upright_torso(!args.free_torso);
     if let Some(lifter) = lifter.as_mut() {
         lifter.set_upper_body(!args.full_body);
     }
@@ -863,6 +867,7 @@ fn main() -> Result<()> {
             trim_start_seconds: args.trim_start.unwrap_or(3.0),
             trim_end_seconds: args.trim_end.unwrap_or(3.0),
             upper_body: !args.full_body,
+            assume_upright_torso: !args.free_torso,
         });
         twin_recorder.save(&args.twin_output)?;
         if args.record.is_none() {

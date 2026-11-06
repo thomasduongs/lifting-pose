@@ -79,6 +79,8 @@ struct Frame {
 struct JointRotation {
     joint: String,
     quaternion_xyzw: [f64; 4],
+    #[serde(default)]
+    confidence: Option<f64>,
 }
 
 pub struct Options<'a> {
@@ -438,9 +440,13 @@ fn render(
     if let Some((subject, pose)) = current {
         let positions = display_positions(record, subject, pose, view.follow, view.upper_body)?;
         for i in 1..N {
-            let unobserved = view.upper_body
+            let unobserved = (view.upper_body
                 && (!crate::scope::body_upper(i)
-                    || !crate::scope::body_upper(record.parents[i].unwrap()));
+                    || !crate::scope::body_upper(record.parents[i].unwrap())))
+                || pose.joint_rotations[i].confidence.is_some_and(|s| s < 0.3)
+                || pose.joint_rotations[record.parents[i].unwrap()]
+                    .confidence
+                    .is_some_and(|s| s < 0.3);
             let color = if unobserved {
                 Scalar::all(100.0)
             } else if pose.prediction.body {
@@ -477,6 +483,10 @@ fn render(
                 * rotation(pose.joint_rotations[9].quaternion_xyzw)?
         };
         let center = (positions[9] + positions[10]) / 2.0;
+        let head_unobserved = pose.prediction.head
+            || [9, 10]
+                .iter()
+                .any(|&i| pose.joint_rotations[i].confidence.is_some_and(|s| s < 0.3));
         let radius = ((positions[10] - positions[9]).norm() * 0.85).max(0.015);
         let head_point = |p: V| project(center + orientation * p);
         for plane in 0..3 {
@@ -491,7 +501,15 @@ fn render(
                 };
                 let current = head_point(p);
                 if let (Some(a), Some(b)) = (previous, current) {
-                    imgproc::line(&mut image, a, b, Scalar::all(225.0), 2, imgproc::LINE_AA, 0)?;
+                    imgproc::line(
+                        &mut image,
+                        a,
+                        b,
+                        Scalar::all(if head_unobserved { 145.0 } else { 225.0 }),
+                        2,
+                        imgproc::LINE_AA,
+                        0,
+                    )?;
                 }
                 previous = current;
             }
@@ -501,7 +519,11 @@ fn render(
                 &mut image,
                 a,
                 b,
-                Scalar::new(90.0, 240.0, 90.0, 0.0),
+                if head_unobserved {
+                    Scalar::all(145.0)
+                } else {
+                    Scalar::new(90.0, 240.0, 90.0, 0.0)
+                },
                 3,
                 imgproc::LINE_AA,
                 0,
@@ -528,7 +550,8 @@ fn render(
             }
         }
         for (i, p) in positions.iter().enumerate() {
-            let unobserved = view.upper_body && !crate::scope::body_upper(i);
+            let unobserved = (view.upper_body && !crate::scope::body_upper(i))
+                || pose.joint_rotations[i].confidence.is_some_and(|s| s < 0.3);
             if let Some(p) = project(*p) {
                 imgproc::circle(
                     &mut image,
@@ -603,16 +626,7 @@ fn render(
             58,
             0.5,
         ),
-        (
-            if view.upper_body {
-                "Gray lower body: unobserved estimate"
-            } else {
-                ""
-            }
-            .into(),
-            82,
-            0.45,
-        ),
+        ("Gray: unobserved or predicted joints".into(), 82, 0.45),
         (
             "Space play/pause | J/L step | A/D orbit | W/S tilt | +/- zoom".into(),
             716,
@@ -673,6 +687,23 @@ fn q_array(q: Q) -> [f64; 4] {
 }
 fn blend_rotation(a: [f64; 4], b: [f64; 4], amount: f64) -> Result<[f64; 4]> {
     Ok(q_array(rotation(a)?.slerp(&rotation(b)?, amount)))
+}
+
+/// Infer missing detail relative to the turning body, preserving measured
+/// camera-space rotations exactly at observation frames.
+fn blend_body_relative(
+    a: [f64; 4],
+    b: [f64; 4],
+    root_a: [f64; 4],
+    root_b: [f64; 4],
+    root_now: [f64; 4],
+    t: f64,
+) -> Result<[f64; 4]> {
+    let a = rotation(root_a)?.inverse() * rotation(a)?;
+    let b = rotation(root_b)?.inverse() * rotation(b)?;
+    let q = rotation(root_now)? * a.slerp(&b, t);
+    let q = q.quaternion();
+    Ok([q.i, q.j, q.k, q.w])
 }
 fn bracket<T>(items: &[(u64, T)], frame: u64) -> (usize, usize) {
     let i = items.partition_point(|p| p.0 < frame);
@@ -805,10 +836,14 @@ fn complete_motion(
             let (a, b) = bracket(items, frame);
             let t = amount(record, items[a].0, items[b].0, frame, fps, override_fps);
             let mut hand = items[a].1.clone();
+            let root_at = |id: u64| anchors[bracket(&anchors, id).0].1.root_orientation_xyzw;
             for i in 0..21 {
-                hand.bone_rotations_xyzw[i] = blend_rotation(
+                hand.bone_rotations_xyzw[i] = blend_body_relative(
                     items[a].1.bone_rotations_xyzw[i],
                     items[b].1.bone_rotations_xyzw[i],
+                    root_at(items[a].0),
+                    root_at(items[b].0),
+                    result.root_orientation_xyzw,
                     t,
                 )?;
             }
@@ -826,9 +861,13 @@ fn complete_motion(
                 override_fps,
             );
             let mut head = head_anchors[a].1.clone();
-            head.orientation_xyzw = blend_rotation(
+            let root_at = |id: u64| anchors[bracket(&anchors, id).0].1.root_orientation_xyzw;
+            head.orientation_xyzw = blend_body_relative(
                 head_anchors[a].1.orientation_xyzw,
                 head_anchors[b].1.orientation_xyzw,
+                root_at(head_anchors[a].0),
+                root_at(head_anchors[b].0),
+                result.root_orientation_xyzw,
                 t,
             )?;
             result.head = Some(head);
@@ -1119,6 +1158,25 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn missing_details_turn_with_the_body_through_a_full_spin() {
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let half = Q::from_axis_angle(&V::y_axis(), std::f64::consts::PI);
+        let q = half.quaternion();
+        let root = [q.i, q.j, q.k, q.w];
+        let detail = Q::rotation_between(&V::y(), &V::x()).unwrap();
+        let q = detail.quaternion();
+        let detail = [q.i, q.j, q.k, q.w];
+        let predicted =
+            rotation(blend_body_relative(detail, detail, identity, identity, root, 0.5).unwrap())
+                .unwrap();
+        assert!((predicted * V::y() + V::x()).norm() < 1e-10);
+        let observed = rotation(
+            blend_body_relative(detail, detail, identity, identity, identity, 0.0).unwrap(),
+        )
+        .unwrap();
+        assert!((observed * V::y() - V::x()).norm() < 1e-10);
+    }
+    #[test]
     fn replay_fk_preserves_shared_lengths_and_root_transform() {
         let parents = vec![None, Some(0), Some(1)];
         let mut record = Recording {
@@ -1150,6 +1208,7 @@ mod tests {
             joint_rotations: (0..17)
                 .map(|i| JointRotation {
                     joint: format!("j{i}"),
+                    confidence: None,
                     quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
                 })
                 .collect(),
@@ -1227,6 +1286,7 @@ mod tests {
             joint_rotations: (0..17)
                 .map(|i| JointRotation {
                     joint: format!("j{i}"),
+                    confidence: None,
                     quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
                 })
                 .collect(),
@@ -1318,6 +1378,7 @@ mod tests {
             joint_rotations: (0..17)
                 .map(|i| JointRotation {
                     joint: format!("j{i}"),
+                    confidence: None,
                     quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
                 })
                 .collect(),
@@ -1416,7 +1477,9 @@ mod tests {
             );
         }
         for (subject, index, angle) in [(0, 0, 0.0), (1, 0, 1.0)] {
-            let q = q_array(Q::from_euler_angles(angle, 0.0, 0.0));
+            let body =
+                rotation(record.subjects[subject].frames[index].root_orientation_xyzw).unwrap();
+            let q = q_array(body * Q::from_euler_angles(angle, 0.0, 0.0));
             record.subjects[subject].frames[index].hands = vec![HandFrame {
                 side: "left".into(),
                 confidence: 0.9,
@@ -1433,6 +1496,15 @@ mod tests {
         let frame = &completed.frames[10];
         assert!(!frame.prediction.body && frame.prediction.hands && frame.prediction.head);
         assert_eq!(frame.hands.len(), 1);
+        let expected = record.subjects[1].frames[0]
+            .head
+            .as_ref()
+            .unwrap()
+            .orientation_xyzw;
+        let measured = completed.frames[20].head.as_ref().unwrap().orientation_xyzw;
+        assert!(
+            (rotation(expected).unwrap().inverse() * rotation(measured).unwrap()).angle() < 1e-10
+        );
         assert!(
             (rotation(frame.head.as_ref().unwrap().orientation_xyzw)
                 .unwrap()
