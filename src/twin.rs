@@ -309,129 +309,6 @@ struct Observation {
     head: Option<HeadPose>,
 }
 
-#[derive(Default)]
-struct HandSmoother {
-    world: [crate::smoothing::AdaptivePoint; 21],
-    pixels: [crate::smoothing::AdaptivePoint; 21],
-}
-#[derive(Default)]
-struct ObservationSmoother {
-    points: [crate::smoothing::AdaptivePoint; N],
-    pixels: [crate::smoothing::AdaptivePoint; N],
-    hands: BTreeMap<String, HandSmoother>,
-    head: crate::smoothing::AdaptiveRotation,
-}
-impl ObservationSmoother {
-    fn apply(&mut self, obs: &Observation) -> Observation {
-        let mut output = obs.clone();
-        if !obs.direct_depth {
-            return output;
-        }
-        let anchor = if is_upper(obs) {
-            obs.points[8]
-        } else {
-            obs.points[0]
-        };
-        let scale = (obs.points[11] - obs.points[14]).norm().max(0.1);
-        for i in 0..N {
-            if obs.scores[i] > 0.0 {
-                let speed = scale
-                    * if [12, 13, 15, 16].contains(&i) {
-                        20.0
-                    } else {
-                        10.0
-                    };
-                output.points[i] = anchor
-                    + self.points[i].filter(
-                        obs.points[i] - anchor,
-                        obs.time_seconds,
-                        scale,
-                        speed,
-                        1.5,
-                    );
-            }
-            if obs.pixel_scores[i] > 0.0 {
-                let p = self.pixels[i].filter(
-                    V::new(obs.pixels[i][0], obs.pixels[i][1], 0.0),
-                    obs.time_seconds,
-                    obs.size.width as f64,
-                    obs.size.width as f64 * 4.0,
-                    15.0,
-                );
-                output.pixels[i] = [p.x, p.y];
-            }
-        }
-        for hand in &mut output.hands {
-            let state = self.hands.entry(hand.side.clone()).or_default();
-            let world = hand.world_landmarks[0].map(f64::from);
-            let pixels = hand.image_landmarks[0].map(f64::from);
-            for i in 1..21 {
-                let relative = V::from(hand.world_landmarks[i].map(f64::from)) - V::from(world);
-                let p = V::from(world)
-                    + state.world[i].filter(relative, obs.time_seconds, 0.08, 2.0, 1.0);
-                hand.world_landmarks[i] = [p.x as f32, p.y as f32, p.z as f32];
-                let relative = V::new(
-                    hand.image_landmarks[i][0] as f64 - pixels[0],
-                    hand.image_landmarks[i][1] as f64 - pixels[1],
-                    0.0,
-                );
-                let p = state.pixels[i].filter(relative, obs.time_seconds, 80.0, 2000.0, 1.0);
-                hand.image_landmarks[i] = [(pixels[0] + p.x) as f32, (pixels[1] + p.y) as f32];
-            }
-        }
-        if let Some(head) = &mut output.head {
-            head.orientation_xyzw = quaternion(self.head.filter(
-                Q::new_normalize(nalgebra::Quaternion::new(
-                    head.orientation_xyzw[3],
-                    head.orientation_xyzw[0],
-                    head.orientation_xyzw[1],
-                    head.orientation_xyzw[2],
-                )),
-                obs.time_seconds,
-            ));
-        }
-        output
-    }
-}
-fn smoothed_observations(observations: &[Observation]) -> Vec<Observation> {
-    let mut state = ObservationSmoother::default();
-    let mut forward: Vec<_> = observations.iter().map(|o| state.apply(o)).collect();
-    let mut state = ObservationSmoother::default();
-    for (raw, output) in observations.iter().zip(&mut forward).rev() {
-        let backward = state.apply(raw);
-        if !raw.direct_depth {
-            continue;
-        }
-        for i in 0..N {
-            output.points[i] = (output.points[i] + backward.points[i]) / 2.0;
-            for axis in 0..2 {
-                output.pixels[i][axis] = (output.pixels[i][axis] + backward.pixels[i][axis]) / 2.0;
-            }
-        }
-        for hand in &mut output.hands {
-            if let Some(other) = backward.hands.iter().find(|h| h.side == hand.side) {
-                for i in 0..21 {
-                    for axis in 0..3 {
-                        hand.world_landmarks[i][axis] =
-                            (hand.world_landmarks[i][axis] + other.world_landmarks[i][axis]) / 2.0;
-                    }
-                    for axis in 0..2 {
-                        hand.image_landmarks[i][axis] =
-                            (hand.image_landmarks[i][axis] + other.image_landmarks[i][axis]) / 2.0;
-                    }
-                }
-            }
-        }
-        if let (Some(head), Some(other)) = (&mut output.head, &backward.head) {
-            let q =
-                |a: [f64; 4]| Q::new_normalize(nalgebra::Quaternion::new(a[3], a[0], a[1], a[2]));
-            head.orientation_xyzw =
-                quaternion(q(head.orientation_xyzw).slerp(&q(other.orientation_xyzw), 0.5));
-        }
-    }
-    forward
-}
-
 fn is_upper(obs: &Observation) -> bool {
     obs.scores[..8].iter().all(|s| *s == 0.0)
 }
@@ -509,7 +386,12 @@ struct FitContext<'a> {
 }
 impl FitContext<'_> {
     fn temporal_weight(&self, i: usize) -> f64 {
-        if is_upper(self.obs) && i < 8 {
+        // Measured joints must not be pulled toward an older pose. Retain
+        // continuity only where neither the 3D nor image position is observed.
+        if (is_upper(self.obs) && i < 8)
+            || self.obs.scores[i] > 0.0
+            || self.obs.pixel_scores[i] > 0.0
+        {
             0.0
         } else {
             self.temporal * (1.0 + 2.0 * (1.0 - self.obs.scores[i]))
@@ -684,7 +566,11 @@ fn inverse(dimensions: Dimensions, obs: &Observation, previous: Option<&Pose>) -
         if obs.assume_upright_torso {
             constrain_upright_torso(p, is_upper(obs));
         }
+        let old_root = p.root;
         align_upper_anchor(dimensions, p, obs);
+        // Rebase the camera seed when the model's arbitrary hip-relative origin
+        // moves. Its camera-space body position must not move with that origin.
+        p.camera = p.camera.map(|camera| camera + old_root - p.root);
     }
     let dt = previous
         .as_ref()
@@ -1144,6 +1030,7 @@ pub struct FrameParameters {
     root_orientation_xyzw: [f64; 4],
     joint_rotations: Vec<JointRotation>,
     root_translation_valid: bool,
+    root_depth_observed: bool,
     root_translation_model: &'static str,
     focal_length_px: f64,
     focal_length_assumed: bool,
@@ -1199,15 +1086,38 @@ fn camera_translation(obs: &Observation, positions: &[V; N]) -> Option<V> {
 fn fit_camera(obs: &Observation, positions: &[V; N]) -> Option<V> {
     fit_camera_seeded(obs, positions, None)
 }
+fn profile_depth_ambiguous(obs: &Observation, positions: &[V; N]) -> bool {
+    if !is_upper(obs) || !obs.direct_depth {
+        return false;
+    }
+    let shoulder = positions[11] - positions[14];
+    let width = (Vector2::from(obs.pixels[11]) - Vector2::from(obs.pixels[14])).norm();
+    let head_height = ((obs.pixels[11][1] + obs.pixels[14][1]) / 2.0 - obs.pixels[9][1]).abs();
+    shoulder.x.abs() < shoulder.norm() * 0.8
+        || (obs.pixel_scores[9]
+            .min(obs.pixel_scores[11])
+            .min(obs.pixel_scores[14])
+            >= 0.5
+            && width < head_height * 1.3)
+}
 fn fit_camera_seeded(obs: &Observation, positions: &[V; N], seed: Option<V>) -> Option<V> {
     let mut camera = camera_translation(obs, positions).or(seed)?;
     if !obs.direct_depth {
         return Some(camera);
     }
+    let profile = profile_depth_ambiguous(obs, positions);
+    // A foreshortened/occluded shoulder baseline cannot identify body depth.
+    // Preserve the previous depth instead of using waving arms as a ruler.
+    let hold_depth = profile && seed.is_some();
+    if hold_depth {
+        camera = seed.unwrap();
+    }
     let weight = |i: usize| {
         obs.pixel_scores[i].min(obs.scores[i]).powi(2)
             * if [0, 7, 8, 9, 10, 11, 14].contains(&i) {
                 1.0
+            } else if hold_depth {
+                0.0
             } else {
                 0.25
             }
@@ -1224,6 +1134,11 @@ fn fit_camera_seeded(obs: &Observation, positions: &[V; N], seed: Option<V>) -> 
             })
             .sum()
     };
+    if let Some(seed) = seed {
+        if !hold_depth && error(seed) < error(camera) {
+            camera = seed;
+        }
+    }
     for _ in 0..8 {
         let mut a = Matrix3::identity() * 1e-4;
         let mut b = V::zeros();
@@ -1237,6 +1152,15 @@ fn fit_camera_seeded(obs: &Observation, positions: &[V; N], seed: Option<V>) -> 
                 a += w * j.transpose() * j;
                 b += w * j.transpose() * residual;
             }
+        }
+        if hold_depth {
+            // Solve image-plane translation with the unobservable depth fixed.
+            a[(0, 2)] = 0.0;
+            a[(1, 2)] = 0.0;
+            a[(2, 0)] = 0.0;
+            a[(2, 1)] = 0.0;
+            a[(2, 2)] = 1.0;
+            b.z = 0.0;
         }
         let Some(mut step) = a.lu().solve(&b) else {
             break;
@@ -1281,7 +1205,9 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
         .sum::<f64>()
         / sum.max(1e-9))
     .sqrt();
-    let translation = fit_camera_seeded(obs, &positions, pose.camera);
+    let translation = pose
+        .camera
+        .or_else(|| fit_camera_seeded(obs, &positions, None));
     let reprojection_rmse_px = translation.and_then(|camera| {
         let mut sum = 0.0;
         let mut weights = 0.0;
@@ -1306,6 +1232,7 @@ fn frame_parameters(dimensions: Dimensions, obs: &Observation, pose: &Pose) -> F
             })
             .collect(),
         root_translation_valid: translation.is_some(),
+        root_depth_observed: translation.is_some() && !profile_depth_ambiguous(obs, &positions),
         root_translation_model: if obs.direct_depth {
             "perspective_translation_fit"
         } else {
@@ -1381,7 +1308,6 @@ struct Subject {
     calibration: Calibration,
     hand_shapes: BTreeMap<String, Vec<Estimate>>,
     depth_references: DepthReferences,
-    smoother: ObservationSmoother,
     observations: Vec<Observation>,
     previous: Option<Pose>,
 }
@@ -1605,7 +1531,11 @@ impl TwinRecorder {
                 }
             }),
             pixel_scores: screen.map(|p| {
-                if p.iter().all(|v| v.is_finite()) && p[0] >= 0.0 && p[1] >= 0.0 {
+                if p.iter().all(|v| v.is_finite())
+                    && p[0] >= 0.0
+                    && p[1] >= 0.0
+                    && p[2] >= threshold
+                {
                     p[2].clamp(0.0, 1.0) as f64
                 } else {
                     0.0
@@ -1637,7 +1567,6 @@ impl TwinRecorder {
                 calibration: Calibration::new(&obs),
                 hand_shapes: BTreeMap::new(),
                 depth_references: DepthReferences::default(),
-                smoother: ObservationSmoother::default(),
                 observations: Vec::new(),
                 previous: None,
             });
@@ -1647,14 +1576,13 @@ impl TwinRecorder {
         self.last_size = Some(size);
         let subject_segment = self.subjects.len() - 1;
         let subject = self.subjects.last_mut().unwrap();
-        let smoothed = subject.smoother.apply(&obs);
         subject
             .calibration
-            .update(&smoothed, f64::from(threshold.max(0.6)));
+            .update(&obs, f64::from(threshold.max(0.6)));
         let dimensions = subject.calibration.dimensions();
         let (solved, fitted_observation) = inverse_with_size(
             dimensions,
-            &smoothed,
+            &obs,
             subject.previous.as_ref(),
             &mut subject.depth_references,
         );
@@ -1723,8 +1651,7 @@ impl TwinRecorder {
             let dimensions = subject.calibration.dimensions();
             let mut previous = None;
             let mut depth_references = DepthReferences::default();
-            let observations = smoothed_observations(&subject.observations);
-            for (index, obs) in observations.iter().enumerate() {
+            for (index, obs) in subject.observations.iter().enumerate() {
                 if index > 0 {
                     writer.write_all(b",")?;
                 }
@@ -1870,6 +1797,12 @@ mod tests {
                 score: 0.9,
             };
         }
+        points[7] = Keypoint {
+            name: "weak_elbow",
+            x: 100.0,
+            y: 100.0,
+            score: 0.1,
+        };
         let mut recorder = TwinRecorder::default();
         assert!(
             recorder
@@ -1892,6 +1825,7 @@ mod tests {
                 )
                 .is_some()
         );
+        assert_eq!(recorder.subjects[0].observations[0].pixel_scores[12], 0.0);
     }
     #[test]
     fn upright_torso_keeps_spine_vertical_without_moving_upper_body_observations() {
@@ -1934,6 +1868,71 @@ mod tests {
         assert!(fit.local[7].angle() < 1e-12);
         assert!((positions[8] - positions[0]).cross(&V::y()).norm() < 1e-12);
         assert!((positions[8] - obs.points[8]).norm() < 1e-12);
+    }
+    #[test]
+    fn changing_the_unseen_hip_origin_does_not_move_a_profile_twin() {
+        let mut truth = Pose::default();
+        truth.orientation = Q::from_axis_angle(&V::y_axis(), std::f64::consts::FRAC_PI_2);
+        let mut obs = observation(0, &truth);
+        obs.direct_depth = true;
+        obs.assume_upright_torso = true;
+        obs.scores[..8].fill(0.0);
+        obs.pixel_scores[..8].fill(0.0);
+        for i in 0..N {
+            obs.pixels[i] = project(obs.points[i], V::new(0.1, -0.08, 2.4), &obs)
+                .unwrap()
+                .0
+                .into();
+        }
+        let first = inverse(dimensions(), &obs, None);
+        let first_root = first.root + first.camera.unwrap();
+        obs.time_seconds = 1.0 / 30.0;
+        for p in &mut obs.points {
+            *p += V::new(0.05, 0.03, 0.2);
+        }
+        let second = inverse(dimensions(), &obs, Some(&first));
+        assert!((second.root + second.camera.unwrap() - first_root).norm() < 1e-5);
+    }
+    #[test]
+    fn previous_pose_penalty_applies_only_to_unobserved_joints() {
+        let mut obs = observation(1, &pose());
+        obs.scores[12] = 0.2;
+        obs.pixel_scores[12] = 0.0;
+        obs.scores[13] = 0.0;
+        obs.pixel_scores[13] = 0.2;
+        obs.scores[16] = 0.0;
+        obs.pixel_scores[16] = 0.0;
+        let context = FitContext {
+            obs: &obs,
+            camera: None,
+            previous: Some(forward(dimensions(), &pose()).0),
+            temporal: 0.6,
+            delta: 0.1,
+        };
+        assert_eq!(context.temporal_weight(12), 0.0);
+        assert_eq!(context.temporal_weight(13), 0.0);
+        assert!(context.temporal_weight(16) > 0.0);
+    }
+    #[test]
+    fn profile_arm_motion_does_not_change_depth_but_image_plane_motion_is_kept() {
+        let mut body = pose();
+        body.orientation = Q::from_axis_angle(&V::y_axis(), std::f64::consts::FRAC_PI_2);
+        let mut obs = observation(0, &body);
+        obs.direct_depth = true;
+        obs.scores[..8].fill(0.0);
+        obs.pixel_scores[..8].fill(0.0);
+        let target = V::new(0.12, -0.08, 2.4);
+        for i in 0..N {
+            obs.pixels[i] = project(obs.points[i], target, &obs).unwrap().0.into();
+        }
+        for i in [12, 13, 15, 16] {
+            obs.pixels[i][0] += 250.0;
+            obs.pixels[i][1] -= 150.0;
+        }
+        let camera = fit_camera_seeded(&obs, &obs.points, Some(V::new(0.0, 0.0, 2.4))).unwrap();
+        assert!(profile_depth_ambiguous(&obs, &obs.points));
+        assert!((camera - target).norm() < 1e-6);
+        assert_eq!(camera.z, 2.4);
     }
     #[test]
     fn perspective_camera_and_projection_jacobian_match_known_geometry() {
@@ -2336,7 +2335,6 @@ mod tests {
             calibration: Calibration::new(&first),
             hand_shapes: BTreeMap::new(),
             depth_references: DepthReferences::default(),
-            smoother: ObservationSmoother::default(),
             observations: Vec::new(),
             previous: None,
         };

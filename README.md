@@ -52,20 +52,20 @@ The 3D viewer can still display the estimated lower-body scaffold.
 
 MediaPipe's image and world landmarks now use the same physical chest/head
 definitions. Fitting combines a robust 3D prior, perspective image reprojection,
-and a time-scaled previous-pose penalty. Camera translation is refined against
+and continuity for unobserved joints only. Camera translation is refined against
 image landmarks with the chosen focal length. Elbow/knee bends are limited to a
 broad 165-degree flexion envelope; bend planes remain free. Upper-body root
 orientation uses the shoulder line and camera vertical so head bobbing does not
 rotate the entire torso.
 
-Adaptive filters use capture timestamps, suppress stationary noise, and respond
-more quickly during movement. They bound large instantaneous jumps and reset
-after observation gaps longer than half a second. The live recording overlay
-also uses adaptive 2D filtering. Final saves smooth observations in both temporal
-directions before refitting the same fixed skeleton, reducing phase lag. Hands
-and head orientation are filtered too; hand scale uses the fitted wrist's camera
-depth. Filtering does not increase detection confidence or turn missing joints
-into measurements. Frames include `reprojection_rmse_px` as an alignment diagnostic.
+Measured body/hand landmarks and head orientations are passed directly to IK,
+without temporal averaging, speed clamping, or a previous-pose penalty on observed
+joints. The live overlay also displays unsmoothed measurements. Previous poses
+provide solver initialization and continuity only for joints without usable 2D
+or 3D observations. Replay still predicts across missing frames. Fixed segment
+lengths, joint limits, and confidence weighting remain active; raw model jitter
+may therefore be more visible. Hand scale uses the fitted wrist's camera depth.
+Frames include `reprojection_rmse_px` as an alignment diagnostic.
 
 Compatibility output retains the 133 landmark slots and the replay's 17-joint
 skeleton. Missing slots have zero confidence. MediaPipe supplies heel and foot-index
@@ -92,8 +92,15 @@ In upright upper-body mode, body yaw is assigned to the root from the fitted
 shoulder direction; the chest joint cannot absorb the whole turn while the body
 root stays facing forward. Reliable shoulders can sustain tracking when the face
 and hands disappear in a back view. The motion prior follows measured torso yaw,
-carrying unobserved limb poses in body-relative coordinates. Camera fitting reuses
-the previous translation as an initialization at narrow profile views.
+carrying unobserved limb poses in body-relative coordinates. At foreshortened profile views, camera depth is retained from the last estimate
+while image-plane placement continues to fit torso/head anchors. Arm waving cannot
+change that depth estimate. `root_depth_observed: false` identifies these inferred
+depths; actual movement toward/away from the camera is not resolved while depth is
+held. A wider shoulder baseline permits a fresh depth fit. Camera initialization
+is rebased when the model's unseen hip origin changes, keeping that origin change
+from shifting the twin. Pixel landmarks below `--threshold` have zero fitting
+weight, so weak occluded arm points use missing-joint continuity instead of
+pulling the skeleton. These safeguards do not average measured poses over time.
 
 Saved joint rotations include their observation `confidence`; replay dims joints
 with little 3D observation support. These are model confidences, not calibrated
@@ -436,7 +443,8 @@ neural model. The root has a null parent.
 
 **Inverse kinematics** fits rotations to confidence-weighted observations with a
 robust loss, damped least-squares rotational updates, and bounded steps. MediaPipe
-adds perspective reprojection and time-scaled motion continuity to the 3D prior.
+adds perspective reprojection to the 3D prior, with motion continuity only for
+unobserved joints.
 The previous solution initializes the solve when helpful; dimensions never change
 inside a pose solve. `fit_rmse` reports the weighted observation residual in model
 units. Missing/low-confidence observations have zero weight. Joint-center fitting

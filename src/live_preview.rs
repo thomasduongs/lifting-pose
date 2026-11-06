@@ -62,7 +62,6 @@ impl LivePreview {
         let (results, output) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
-        let mut smoother = crate::smoothing::LandmarkSmoother::default();
         let preview_start = Instant::now();
         let worker = thread::Builder::new()
             .name("recording-pose-preview".into())
@@ -112,11 +111,6 @@ impl LivePreview {
                         } else if estimator.is_mediapipe() {
                             crate::details::merge_hand_landmarks(&mut points, &[]);
                         }
-                        smoother.apply(
-                            &mut points,
-                            captured.duration_since(preview_start).as_secs_f64(),
-                            size.width as f64,
-                        );
                         // Keep head anchors; omit dense facial landmarks from the overlay.
                         for point in points.iter_mut().take(91).skip(23) {
                             point.score = 0.0;

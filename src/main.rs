@@ -12,7 +12,6 @@ mod pose;
 mod recording;
 mod replay;
 mod scope;
-mod smoothing;
 mod tracking;
 mod twin;
 
