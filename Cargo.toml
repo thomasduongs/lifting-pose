@@ -9,9 +9,12 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-opencv = { version = "0.101.1", default-features = false, features = ["clang-runtime", "dnn", "highgui", "imgcodecs", "imgproc", "videoio"] }
+opencv = { version = "0.101.1", default-features = false, features = ["clang-runtime", "dnn", "highgui", "imgcodecs", "imgproc", "video", "videoio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }
 tempfile = "3"
 zip = { version = "2.4.2", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "coreml"] }

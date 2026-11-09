@@ -24,17 +24,27 @@ and projected-landmark stabilization. This lets you compare the new body model
 without those corrections overriding its predictions. Body units are inferred
 meters, not camera-calibrated measurements. Live recording uses the new model too.
 Hands use a dedicated MediaPipe palm detector, followed by an oriented crop and
-21-point hand inference. Palm detection runs independently of the body's coarse
-finger guesses. Previous hand bounds and body anchors provide recovery crops;
+21-point hand inference. Palm detection runs in a padded crop around the selected
+person, including reliable wrists outside an older person box. A missing hand gets
+a closer palm-detection pass around a reliable body wrist. Crop transforms keep
+their centers in original image coordinates at every hand orientation. Palm
+detection runs independently of the body's coarse finger guesses.
+Previous hand bounds and body anchors provide recovery crops;
 every accepted hand is inferred afresh. Left/right assignment uses body wrists
-and recent hand positions. Confirmed hand wrists replace the corresponding body
+and recent hand positions. Strong hand wrists replace the corresponding body
 wrist image positions, so finger skeletons connect to the arms. A body depth prior
 that strongly disagrees with the hand's location is excluded from wrist fitting.
+Direct hand-landmark replacement below 0.85 does not displace a body wrist with confidence at least
+0.8 unless two fresh, consistent hand detections both have confidence at least 0.65.
+This confirmation uses the current measured hand position and keeps its original
+confidence; it does not average positions or promote a prediction to an observation.
+Other weaker crops can still supply finger observations.
 Unconfirmed coarse finger guesses are not drawn.
 Tracking crops extrapolate recent wrist motion and palm scale, add a margin, and
 retry with a wider crop after a miss. A high-confidence nearby hand only suppresses
 a recovery attempt when its wrist matches the expected wrist. Palm NMS permits
-more overlap, while landmark/handedness checks remove duplicate detections.
+more overlap, while matching landmark geometry removes duplicate detections even
+when the crops disagree on handedness.
 New hands still require 0.65 presence confidence. A recently reliable hand may
 continue at 0.5 for up to 0.3 seconds, with a bound on wrist displacement.
 
@@ -50,6 +60,13 @@ remain internal to body fitting, and head position still follows the body model.
 Sparse-face head orientation is off by default; `--head-orientation` opts back in.
 The 3D viewer can still display the estimated lower-body scaffold.
 
+MediaPipe upper-body inference uses a torso-centered virtual full-body crop twice
+the visible detector-box height, retaining more arm detail than the old 3x crop.
+If pose detection fails during a turn, it retries 2.5x and 3x crops. Its 64x64
+landmark heatmap refines image coordinates with MediaPipe's same-frame 7x7 spatial
+centroid method; this does not smooth motion over time or boost visibility scores.
+Reference: [MediaPipe pose postprocessing](https://github.com/google-ai-edge/mediapipe/blob/master/mediapipe/modules/pose_landmark/tensors_to_pose_landmarks_and_segmentation.pbtxt).
+
 MediaPipe's image and world landmarks now use the same physical chest/head
 definitions. Fitting combines a robust 3D prior, perspective image reprojection,
 and continuity for unobserved joints only. Camera translation is refined against
@@ -58,16 +75,170 @@ broad 165-degree flexion envelope; bend planes remain free. Upper-body root
 orientation uses the shoulder line and camera vertical so head bobbing does not
 rotate the entire torso.
 
-Measured body/hand landmarks and head orientations are passed directly to IK,
-without temporal averaging, speed clamping, or a previous-pose penalty on observed
-joints. The live overlay also displays unsmoothed measurements. Previous poses
-provide solver initialization and continuity only for joints without usable 2D
-or 3D observations. Replay still predicts across missing frames. Fixed segment
-lengths, joint limits, and confidence weighting remain active; raw model jitter
-may therefore be more visible. Hand scale uses the fitted wrist's camera depth.
-Frames include `reprojection_rmse_px` as an alignment diagnostic.
+Raw body/hand landmarks and head orientations are retained without speed clamping.
+The bounded continuity and adaptive filtering stages are described below. Abrupt shoulder, elbow, or wrist detection errors can
+be replaced by current-frame image-motion evidence when forward/backward optical flow agrees;
+this gate does not keep dragging a joint onto an old shirt patch. The live overlay
+uses the same measurement gate. An arm point replaced by image correspondence contributes
+only its 2D position; its inconsistent neural depth is excluded from fitting and
+dimension calibration. Missing points remain unobserved, and a failed
+correspondence leaves the detector's observation intact. Wrist correspondence
+starts at an independently detected hand: one strong detection or two consecutive,
+consistent moderate detections. It can correct a weak but present body wrist,
+without increasing its confidence. A confident body landmark on a shirt cannot
+seed wrist tracking. Each confirmed hand supports at most two successive wrist
+corrections, each requiring a new forward/backward image check and a detector
+innovation. A failed check ends the chain immediately; image correspondence
+cannot renew its own two-step allowance. Hand detection retains the original body-wrist crop and
+also searches near a corrected wrist, so a crop shift does not discard the
+original search location.
+For file processing and the final recording pass, MediaPipe automatically uses
+`models/rtmpose-m.onnx` as an additional arm image model when that file is installed.
+Only sufficiently supported, in-frame elbow/wrist measurements are adopted;
+validated wrist image flow and subsequent dedicated hand detections retain their
+roles. Torso, head, and native body depth still come from MediaPipe. If an arm image
+correction conflicts substantially with its native 3D location, that joint's stale
+depth is excluded from fitting/calibration. The landmark log records adopted RTM
+body observations in `arm_refined` (COCO indices, before dedicated hand merging
+and final occlusion gates). This reduces pose jumps caused by an
+elbow or wrist landing on the torso during blurred movement, without averaging
+away real motion.
 
-Compatibility output retains the 133 landmark slots and the replay's 17-joint
+The extra model runs on each processed frame and increases processing time.
+The live recording overlay uses that RTM model directly for 2D body joints,
+plus the dedicated hand model. It does not run two body networks merely to display
+2D landmarks. The saved 3D pass still uses MediaPipe with RTM arm refinement.
+`--no-arm-refinement` keeps the selected primary model in both paths;
+`--arm-model /path/to/rtmpose.onnx` chooses the image model explicitly. No additional model
+is downloaded automatically. MediaPipe-only installations continue to work.
+
+Joint continuity now adds a second, bounded check after dedicated hand merging.
+It tracks a 3x3 set of image patches around each body joint, requires spatially
+distributed forward/backward-consistent matches, and compares that motion with a
+short velocity forecast before replacing a conflicting detector location. Explicit
+arm-overlap masks block image-based reacquisition of the hidden arm. Strong fresh
+hand detections can reacquire the wrist immediately. Corrected image measurements
+cannot supply native depth or calibrate segment lengths from that stale depth.
+
+If correspondence also fails, a decaying velocity forecast may draw a gray joint
+for at most 160 ms. These predictions have zero measurement confidence and are
+excluded from calibration and observed IK constraints. Tracking resets after a
+long gap, non-increasing timestamps, resolution changes, or a different person crop.
+The JSON Lines log retains `observed_keypoints` before this continuity stage,
+`joint_tracking` provenance/age/inlier counts, and separate `predicted_joints`.
+`observed_native_scores` preserves native confidence before the new depth rejection
+gates; the native joint coordinates remain available in `pose3d`.
+
+An adaptive time-based filter suppresses small stationary jitter while responding
+more quickly to fast motion. It can move a body landmark by at most 2.5 pixels
+from its accepted image measurement (1.5 pixels for finger landmarks). It does not
+cap movement speed. File processing uses this causal continuity/filtering stage.
+The live recording overlay uses current-frame image correspondence directly;
+it does not repeat optical flow or adaptive averaging in the slower neural worker.
+
+During recording, person detection has its own worker and refreshes every 15
+camera frames by default; it cannot stall the body/hand worker. Known hands first
+get fresh hand-model inference in their tracked regions. A wider palm search runs
+when that fails; predictions are crop proposals, not measured hand landmarks.
+Models warm up before capture starts. Two consistent moderate hand detections can
+confirm wrist identity even when inference intervals exceed 100 ms.
+
+The camera overlay follows image features on **each captured frame**, including
+fingers. A short clean-image history aligns delayed neural results to the current
+image before using them. Matching neural observations renew joint identity while
+current image correspondence supplies the location; missing partial observations
+do not erase a still-visible finger track. Contradictory neural jumps cannot
+immediately displace verified tracks, and neither optical flow nor predictions
+can renew their own neural support indefinitely. Live image tracks have a bounded
+350 ms semantic lease with fresh forward/backward checks on every image. Pure
+velocity forecasts retain the shorter 160 ms limit and zero confidence.
+The image tracker works at up to 640 pixels wide and returns original-image
+coordinates; neural inference retains its normal full-frame crop resolution.
+All of this works with `--no-smoothing`, without a finished recording or replay.
+
+Fresh body observations are published as soon as body inference finishes; they
+are not held until hand reacquisition completes. Body and hand updates from the
+same source frame are fused independently, without discarding partial updates.
+
+On macOS, the live networks can use ONNX Runtime with CoreML. Warm-up compares
+native and OpenCV inference on each model and retains the faster backend; a
+runtime failure falls back to OpenCV. The model, crop preprocessing, and output
+decoding remain unchanged. `--no-acceleration` forces the OpenCV path. No Python
+runtime is required. The first Cargo build fetches the pinned native runtime;
+CoreML's first model compilation may take several minutes before capture starts.
+Compiled models are cached under `~/Library/Caches/lifting-pose/coreml` using model
+content in the cache key, so changing weights cannot reuse the wrong compiled model.
+The selected recording/3D model still uses its existing inference path.
+
+OpenCV defaults to at most four CPU threads so detection, hand/body inference,
+and camera image tracking can share the CPU. `--opencv-threads N` overrides it.
+Live image-tracking errors trigger reacquisition while recording continues.
+
+Final twin export additionally performs two five-frame sequence IK sweeps against
+neighboring FK poses and each frame's own observations, with one fixed person
+shape. A centered adaptive rotation/root filter follows: slow motion receives more
+filtering, fast motion less. All edits in this recording-only pass together may increase any
+strong visible joint's image-fit error by at most 2.5 pixels relative to its
+input per-frame IK fit. Long gaps are not included in the temporal window.
+This recording-only pass can use future observations without adding live latency.
+The twin JSON describes its settings in `motion_processing`.
+
+`--no-smoothing` disables the adaptive jitter filters while retaining rejection,
+short-gap tracking and sequence IK. `--no-stabilization` disables all four new
+stabilization stages for comparison. Previously saved twins must be reprocessed
+from their source video to receive sequence fitting; replay alone does not alter
+stored joint rotations.
+
+Camera translation and joint rotations optimize the same reprojection objective;
+image residual scale stays fixed during each
+solve, and a later camera refit cannot invalidate the fitted joint projection.
+High-confidence visible elbow/wrist image constraints get more weight than
+uncertain monocular world predictions. Their weight changes continuously with
+confidence, and additional coordinate sweeps let coupled arm/camera updates
+converge; already converged fits still stop early.
+Previous poses provide initialization and continuity for joints without
+usable observations. A visible arm joint with rejected native depth retains
+continuity in its unmeasured depth relative to the thorax; measured image motion
+is not averaged. This depth prior is time based and follows torso turns rather
+than holding the person fixed in space. Replay predicts missing frames. Fixed segment lengths,
+joint limits, and confidence weighting remain active. Frames include
+`reprojection_rmse_px` as an alignment diagnostic, not ground-truth pose accuracy.
+It includes observed image landmarks even when their native 3D depth is rejected,
+so a visible wrist cannot disappear from the error report merely because its
+depth is uncertain.
+
+Final saved upright upper-body recordings also estimate a continuous torso-heading
+trajectory from the per-frame fits. A robust angular-acceleration prior reduces
+isolated shoulder-depth/identity spikes, with weaker heading evidence in profile.
+The original image observations are then fitted again with this torso heading;
+observed arm coordinates are not averaged. This is a temporal constraint on the
+derived torso rotation, so it can change estimated heading near a turn. It does
+not establish the true orientation of a hidden torso or arm. The provisional
+live fit does not have future frames and does not use this batch constraint.
+
+New MediaPipe fits use the midpoint between the ears for the head-center anchor,
+with the nose as a direction reference. The replay draws the skull at that center
+and an inferred gray neck connection, rather than drawing the chest-to-nose fit
+as an anatomical neck. Skull radius is one shared person parameter, calibrated
+from near-frontal face/shoulder widths; profile samples cannot resize it. This is
+an approximate head model, not a measured cervical spine or cranial surface.
+Saves mark the anchor convention with `ear_head`; older saves retain their
+original eye-based convention when replayed.
+
+The head has an independent, zero-offset `head_pivot` control at the thorax.
+The body and camera are fitted first; a separate head fit keeps the body fixed.
+The ear midpoint supplies skull position; the nose supplies direction. The
+current frame's body fit supplies a head-depth prior. The native nose-to-head
+direction helps reject ambiguous depth flips without averaging observed head
+motion. Brief unobserved head articulation carries the last estimate in body
+coordinates.
+
+New saves use schema 2 with 18 stored joints, including that virtual control.
+Replay still accepts schema 1's 17-joint saves. Consumers should read
+`joint_names` and `parents`; the new control shifts subsequent exported indices.
+All rotations retain the standard outgoing-bone, parent-local FK convention.
+
+Compatibility output retains the 133 landmark slots and the model's 17-joint
 skeleton. Missing slots have zero confidence. MediaPipe supplies heel and foot-index
 points; it does not distinguish big and small toes, so separate small-toe slots
 are unobserved. Dense face tracking is absent. Old saves replay unchanged; record
@@ -92,15 +263,41 @@ In upright upper-body mode, body yaw is assigned to the root from the fitted
 shoulder direction; the chest joint cannot absorb the whole turn while the body
 root stays facing forward. Reliable shoulders can sustain tracking when the face
 and hands disappear in a back view. The motion prior follows measured torso yaw,
-carrying unobserved limb poses in body-relative coordinates. At foreshortened profile views, camera depth is retained from the last estimate
-while image-plane placement continues to fit torso/head anchors. Arm waving cannot
-change that depth estimate. `root_depth_observed: false` identifies these inferred
-depths; actual movement toward/away from the camera is not resolved while depth is
-held. A wider shoulder baseline permits a fresh depth fit. Camera initialization
+carrying unobserved limb poses in body-relative coordinates. At foreshortened
+profile views, instantaneous depth is ambiguous. Final native upper-body saves
+estimate a shared body-distance trajectory from the perspective fits, robust
+shirt-feature scale changes, and a timestamp-based acceleration prior. This
+prior applies to inferred body distance, not measured arm landmarks or joint
+rotations. Depth can change through a side view; weak/missing depth evidence is
+predicted using neighboring recording frames. `root_depth_observed: false`
+identifies inferred depth. Clothing deformation, occlusion, and monocular scale
+ambiguity still limit accuracy. Online previews remain provisional.
+Camera initialization
 is rebased when the model's unseen hip origin changes, keeping that origin change
 from shifting the twin. Pixel landmarks below `--threshold` have zero fitting
 weight, so weak occluded arm points use missing-joint continuity instead of
 pulling the skeleton. These safeguards do not average measured poses over time.
+
+For MediaPipe, a weak elbow/wrist landmark on a strongly observed opposite arm
+is treated as occluded. Its 2D/3D fitting weights are zero until observations
+return, and it does not calibrate segment lengths. Confident crossing arms and
+independently visible wrists remain measurements. Unobserved arm articulation is
+carried into both IK starting poses, including when the other arm moves. Confirmed
+hand observations can still restore a wrist's 2D constraint; duplicate palm crops
+cannot supply both hands even if their handedness predictions disagree. New hand
+detections need a body wrist or recent same-side hand track to establish their
+left/right identity; screen position alone is unreliable during turns. A
+moderately confident hand must also agree with that arm's wrist or recent hand location.
+Two consistent independent hand detections also provide a reference for up to
+0.2 seconds: a moderately confident body wrist that jumps far from that reference
+onto the strongly observed opposite arm is excluded. This reference only rejects
+an observation; it never supplies a measured joint position. A fresh hand detection
+can restore the wrist immediately, and confident crossing wrists remain observations.
+Lower-confidence recovery is reserved for the same arm's recent hand track. These
+checks do not smooth visible motion or recover ground-truth hidden joint positions.
+Final recordings interpolate an unobserved arm chain between neighboring observed
+rotations in body coordinates. A visible wrist keeps its fitted chain even if the
+elbow is hidden. Predicted joint confidence remains zero.
 
 Saved joint rotations include their observation `confidence`; replay dims joints
 with little 3D observation support. These are model confidences, not calibrated
@@ -172,7 +369,7 @@ These measurements are landmark spans, not body silhouette widths. Rotation
 compensation still depends on inferred 3D orientation, so turning and moving in
 depth can remain ambiguous. Hidden or unreliable segments contribute no size
 cue; default upper-body mode does not measure unseen legs. Separate toe/heel
-depth or body-surface thickness is not represented by the 17-joint skeleton.
+depth or body-surface thickness is not represented by the landmark skeleton.
 
 Using body axes **X forward/back, Y side-to-side, Z up/down**, a frontal camera
 maps forward toward the camera. The saved format retains camera coordinates for
@@ -237,6 +434,14 @@ a temporary directory; it needs no models, Python, camera, or extracted videos.
 Custom `.twin` paths are supported after `--record` or `--replay`; legacy standalone
 `twin.json` inputs also remain supported. `--output other.mp4` overrides the replay
 video destination. Record mode keeps all generated assets inside the save.
+New recordings also keep their raw landmark log inside that same save.
+
+Replay defaults to a shaded baseline human body around the calibrated skeleton:
+torso, pelvis, articulated limbs, head, palms, and fingers. The surface follows the
+existing FK joints and fixed segment lengths. Body thickness uses stable baseline
+ratios to shoulder/pelvis width; it is not a body scan or a measured muscle/fat model.
+Missing hand detail uses a neutral hand, and unseen lower-body parts remain gray.
+Press **B** to cycle body, skeleton, and body-with-skeleton views.
 
 Recorded times control replay. Missing body, head, and hand poses are completed
 from surrounding observations; rotations are interpolated while FK keeps shared
@@ -252,6 +457,7 @@ are not fed back into dimension calibration.
 | A / D | Orbit left / right |
 | W / S | Tilt the view |
 | + / - | Zoom |
+| B | Cycle body / skeleton / body with skeleton |
 | 1 / 2 / 3 | Front / side / oblique view |
 | F | Toggle in-place view / approximate root motion |
 | N | Toggle joint names |
@@ -266,8 +472,9 @@ and the best-supported hand shapes across the selected recording so segment
 boundaries cannot resize the skeleton. This assumes one continuing person;
 select a specific subject if the recording contains a real identity change. Use `--replay-subject 1` to explicitly filter and trim to one segment.
 Older files without timing default to 30 FPS; `--replay-fps 15` overrides timing.
-The 3D view includes the 17-joint body, an outlined head with a forward-direction
-cue, and 21 landmarks per reliably detected hand. It has no skin mesh or 3D toes.
+The body view includes a procedural surface and neutral facial features for
+orientation. Skeleton view retains the outlined head, direction cue, and 21
+landmarks per reliably detected hand. Feet use baseline shapes, without tracked toes.
 
 Dedicated 3D hands use OpenCV Zoo's MediaPipe HandPose model, with MediaPipe Pose
 palm detections providing aligned crops and previous hand landmarks providing recovery crops. Each subject stores shared hand bone lengths;
@@ -290,8 +497,13 @@ Legacy folder recordings can still be processed directly using `--input`,
 reuses its acquisition times. For new recordings, use the bundled workflow above
 to avoid creating separate files.
 
-Replay video exports use a 1024×768 oblique in-place view. Irregular capture
-timestamps are resampled to constant FPS for MP4. Remove `--no-display` to export
+Replay opens and exports in a 1024×768 straight-on view showing recorded root
+movement through a fixed scene, with zero camera yaw and tilt. Reset (R) restores this front view and root movement; F
+toggles the optional in-place view. Translation does not change the saved joint
+angles, which are calculated from relative bone directions. Irregular capture
+timestamps are resampled to constant FPS with time-based root/quaternion
+interpolation; original observed samples and fixed bone lengths are preserved.
+Remove `--no-display` to export
 first and then open interactive replay. `--max-frames` limits the source-frame
 span for preview/export. The source video and twin JSON are protected against
 being selected as the replay output.
@@ -333,7 +545,7 @@ Joint angles are displayed automatically beside the selected person's joints.
 With 3D lifting enabled, yellow shoulder, elbow, hip, and knee labels use fitted
 **3D interior angles** and carry a `3D` suffix. Wrist and ankle angles retain a
 `2D` suffix because MotionAGFormer has no finger or toe outputs. A small inset
-shows an oblique view of the fitted skeletal twin. The existing JSON
+shows a straight-on view of the fitted skeletal twin. The existing JSON
 `angles` field still contains all twelve 2D angles; 3D angles are separate.
 
 Use `--no-3d` to disable lifting and display only 2D labels. These are unsigned **2D interior
@@ -598,6 +810,33 @@ normalized x, normalized y, and 2D confidence. Select a compatible export with
 `--motion-model /path/to/motionagformer-xs.onnx`.
 Upstream MotionAGFormer is [Apache-2.0 licensed](https://github.com/TaatiTeam/MotionAGFormer/blob/master/LICENSE).
 
+### VideoPose3D evaluation
+
+VideoPose3D currently has a local evaluation harness; recordings continue to use
+the current MediaPipe fit. `scripts/export_videopose3d.py` converts the
+[official COCO checkpoint](https://github.com/facebookresearch/VideoPose3D/blob/main/INFERENCE.md)
+using an upstream source checkout. The one-time export environment needs PyTorch,
+NumPy, ONNX, and ONNX Runtime. The Rust evaluation runs inference with OpenCV.
+Upstream code and weights retain their
+[CC BY-NC license](https://github.com/facebookresearch/VideoPose3D/blob/main/LICENSE).
+
+```sh
+VP_EVAL=/tmp/lifting-pose-vp-eval
+python scripts/export_videopose3d.py \
+  --source /path/to/VideoPose3D \
+  --checkpoint /path/to/pretrained_h36m_detectron_coco.bin \
+  --output "$VP_EVAL/videopose3d/videopose3d.onnx"
+LIFTING_EVAL_DIR="$VP_EVAL" cargo test --release \
+  videopose3d_matches_export_reference -- --ignored
+```
+
+The exporter verifies reference/optimized PyTorch and ONNX predictions and saves
+reference tensors beside the model. The Rust check compares the same tensors.
+Its fixed input is `[1,243,17,2]` normalized COCO image coordinates; output is `[1,1,17,3]`
+inferred Human3.6M joints. Recording comparisons use acquisition timestamps and
+centered model windows. Missing joints and neutral lower-body context stay
+unobserved in the fit; a model producing all joints does not verify hidden poses.
+
 If OpenCV discovery fails, ensure its pkg-config directory is on
 `PKG_CONFIG_PATH`, for example on Homebrew:
 
@@ -696,6 +935,8 @@ cargo test
 - `src/tracking.rs`: learned-dimension landmark stabilization, bounded inferred
   joint display, and crop feedback between detector refreshes.
 - `src/recording.rs`: unannotated capture/import and capture timing, before inference.
+- `src/avatar.rs`: baseline human surface, articulated hands, shading, and depth-buffer rendering.
+- `src/joint_tracking.rs`: multi-patch joint correspondence, short predictions, and adaptive image filtering.
 - `src/replay.rs`: model-free twin loading, FK reconstruction, timed interactive
   playback, orbit/zoom controls, and headless 3D video export.
 - `scripts/export_motionagformer.py`: one-time checkpoint-to-ONNX conversion and
@@ -706,7 +947,9 @@ cargo test
 - `src/landmarks.rs`: COCO-WholeBody landmark names and body/foot/hand skeleton
   connections, using the [official MMPose dataset metadata](https://github.com/open-mmlab/mmpose/blob/main/configs/_base_/datasets/coco_wholebody.py).
 - `src/mediapipe.rs`: MediaPipe Pose preprocessing, sparse-landmark mapping, native 3D observations.
-- `src/live_preview.rs`: asynchronous recording overlay without blocking capture.
+- `src/live_preview.rs`: independent live detection and pose workers with fresh hand-region inference.
+- `src/preview_tracking.rs`: current-image joint tracking and delayed neural-result alignment.
+- `src/accelerated.rs`: native macOS execution, model warm-up selection, and OpenCV fallback.
 - `src/main.rs`: CLI, capture/preview, image/video saving, JSON Lines output.
 
 Alternative models: [official RTMPose/RTMW model zoo](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose).

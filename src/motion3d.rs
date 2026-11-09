@@ -76,12 +76,19 @@ pub struct Joint3d {
 
 #[derive(Debug, Serialize)]
 pub struct Pose3d {
+    /// Head slot is the ear midpoint instead of the legacy eye midpoint.
+    pub ear_head: bool,
     pub model: &'static str,
     pub coordinate_space: &'static str,
     pub units: &'static str,
     pub history_frames: usize,
     pub joints: Vec<Joint3d>,
     pub angles: Vec<JointAngle>,
+}
+impl Pose3d {
+    pub(crate) fn has_metric_camera_coordinates(&self) -> bool {
+        self.coordinate_space == "root_relative_camera" && self.units == "estimated_meters"
+    }
 }
 
 #[derive(Default)]
@@ -302,6 +309,14 @@ impl MotionLifter {
         if !self.history.push(points, bbox, size, threshold) {
             return Ok(None);
         }
+        self.infer_history(FRAMES - 1, threshold).map(Some)
+    }
+
+    fn infer_history(&mut self, frame_index: usize, threshold: f32) -> Result<Pose3d> {
+        ensure!(
+            frame_index < FRAMES && !self.history.frames.is_empty(),
+            "Invalid temporal output index"
+        );
         let input = self.history.tensor();
         let mat = Mat::from_slice(&input)?;
         let blob = mat.reshape_nd(1, &[1, FRAMES as i32, JOINTS as i32, 3])?;
@@ -322,8 +337,9 @@ impl MotionLifter {
             values.iter().all(|v| v.is_finite()),
             "MotionAGFormer produced non-finite coordinates"
         );
-        let latest = &values[(FRAMES - 1) * JOINTS * 3..];
-        let scores = self.history.frames.back().unwrap();
+        let latest = &values[frame_index * JOINTS * 3..(frame_index + 1) * JOINTS * 3];
+        let padding = FRAMES - self.history.frames.len();
+        let scores = &self.history.frames[frame_index.saturating_sub(padding)];
         let joints: Vec<_> = (0..JOINTS)
             .map(|i| Joint3d {
                 name: NAMES[i],
@@ -334,14 +350,15 @@ impl MotionLifter {
             })
             .collect();
         let angles = angles3d(&joints, threshold);
-        Ok(Some(Pose3d {
+        Ok(Pose3d {
+            ear_head: false,
             model: "MotionAGFormer-XS-H36M",
             coordinate_space: "root_relative_camera",
             units: "model_normalized",
             history_frames: self.history.frames.len(),
             joints,
             angles,
-        }))
+        })
     }
 }
 
@@ -484,6 +501,244 @@ pub fn draw(image: &mut Mat, pose: &Pose3d) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires local ONNX model and reference tensor files"]
+    fn temporal_onnx_reference_preserves_center_and_latest_alignment() -> Result<()> {
+        let read = |path: &str| -> Result<Vec<f32>> {
+            let bytes = std::fs::read(path)?;
+            ensure!(bytes.len() % 4 == 0, "Invalid tensor bytes");
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect())
+        };
+        let input = read("models/motionagformer-xs.input.f32")?;
+        let expected = read("models/motionagformer-xs.expected.f32")?;
+        ensure!(
+            input.len() == FRAMES * JOINTS * 3 && expected.len() == input.len(),
+            "Wrong tensor shape"
+        );
+        let mut lifter = MotionLifter::new(Path::new("models/motionagformer-xs.onnx"))?;
+        for frame in input.chunks_exact(JOINTS * 3) {
+            lifter.history.frames.push_back(std::array::from_fn(|i| {
+                [frame[i * 3], frame[i * 3 + 1], frame[i * 3 + 2]]
+            }));
+        }
+        for index in [FRAMES / 2, FRAMES - 1] {
+            let pose = lifter.infer_history(index, 0.3)?;
+            let source = &expected[index * JOINTS * 3..(index + 1) * JOINTS * 3];
+            for (i, joint) in pose.joints.iter().enumerate() {
+                for (axis, value) in [joint.x, joint.y, joint.z].into_iter().enumerate() {
+                    assert!(
+                        (value - (source[i * 3 + axis] - source[axis])).abs() < 1e-4,
+                        "Frame {index} joint {i} axis {axis}"
+                    );
+                }
+                assert_eq!(joint.input_score, input[index * JOINTS * 3 + i * 3 + 2]);
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires local recording/model; cached-landmark temporal lifting comparison"]
+    fn evaluate_recorded_temporal_lifting() -> Result<()> {
+        use std::io::Write;
+        let directory = std::path::PathBuf::from(std::env::var("LIFTING_EVAL_DIR")?);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("twin.json"))?)?;
+        let meta = &original["recording"];
+        let times: Vec<f64> = serde_json::from_value(meta["timestamps_seconds"].clone())?;
+        let mut lifter = MotionLifter::new(Path::new("models/motionagformer-xs.onnx"))?;
+        lifter.set_upper_body(true);
+        let mut recorder = crate::twin::TwinRecorder::default();
+        recorder.set_upright_torso(true);
+        let centered = std::env::var_os("LIFTING_EVAL_CENTERED").is_some();
+        let calibrated = std::env::var_os("LIFTING_EVAL_CONTEXT").is_some();
+        let metric = std::env::var_os("LIFTING_EVAL_METRIC").is_some();
+        ensure!(
+            !metric || calibrated,
+            "Metric-prior comparison requires calibrated context"
+        );
+        ensure!(
+            !calibrated || centered,
+            "Calibrated-context diagnostic requires centered windows"
+        );
+        let tag = if metric {
+            "motionmetric"
+        } else if calibrated {
+            "motionheight"
+        } else if centered {
+            "motioncenter"
+        } else {
+            "motion27"
+        };
+        let native: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("verifiedarms-twin.json"))?)?;
+        let body_width = native["subjects"][0]["person"]["shoulder_width"]
+            .as_f64()
+            .unwrap();
+        let input: Vec<serde_json::Value> =
+            std::fs::read_to_string(directory.join("verifiedarms.jsonl"))?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?;
+        let get = |person: &serde_json::Value| {
+            let points: Vec<_> = person["keypoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(i, k)| Keypoint {
+                    name: crate::landmarks::NAMES[i],
+                    x: k["x"].as_f64().unwrap() as f32,
+                    y: k["y"].as_f64().unwrap() as f32,
+                    score: k["score"].as_f64().unwrap() as f32,
+                })
+                .collect();
+            let b = &person["bbox"];
+            let bbox = Bbox {
+                x: b["x"].as_f64().unwrap() as f32,
+                y: b["y"].as_f64().unwrap() as f32,
+                width: b["width"].as_f64().unwrap() as f32,
+                height: b["height"].as_f64().unwrap() as f32,
+            };
+            (points, bbox)
+        };
+        let mut output = std::io::BufWriter::new(std::fs::File::create(
+            directory.join(format!("{tag}.jsonl")),
+        )?);
+        for (index, source) in input.iter().enumerate() {
+            let mut row = source.clone();
+            let n = row["frame"].as_u64().unwrap();
+            let width = row["width"].as_i64().unwrap() as i32;
+            let height = row["height"].as_i64().unwrap() as i32;
+            for person in row["people"].as_array_mut().unwrap() {
+                let (points, bbox) = get(person);
+                let mut pose = if centered {
+                    lifter.history.clear();
+                    for offset in 0..FRAMES {
+                        let sample = (index as isize + offset as isize - (FRAMES / 2) as isize)
+                            .clamp(0, input.len() as isize - 1)
+                            as usize;
+                        let (context, roi) = get(&input[sample]["people"][0]);
+                        lifter
+                            .history
+                            .push(&context, roi, Size::new(width, height), 0.3);
+                        if calibrated {
+                            // Diagnostic intervention only: preserve foreshortened
+                            // horizontal context, but infer vertical extent from
+                            // shared body width and the existing distance fit.
+                            let frame = &native["subjects"][0]["frames"][sample];
+                            ensure!(
+                                frame["frame"].as_u64() == Some(sample as u64),
+                                "Mismatched context timing"
+                            );
+                            let vertical = (frame["focal_length_px"].as_f64().unwrap() * body_width
+                                / frame["root_position"][2].as_f64().unwrap())
+                                as f32;
+                            let horizontal = (context[5].x - context[6].x)
+                                .hypot(context[5].y - context[6].y)
+                                .max(20.0);
+                            let cx = (context[5].x + context[6].x) / 2.0;
+                            let cy = (context[5].y + context[6].y) / 2.0;
+                            let mut coco = lifter.history.previous_coco.unwrap();
+                            for (i, dx, dy) in [
+                                (11, 0.3, 1.0),
+                                (12, -0.3, 1.0),
+                                (13, 0.3, 2.0),
+                                (14, -0.3, 2.0),
+                                (15, 0.3, 3.0),
+                                (16, -0.3, 3.0),
+                            ] {
+                                coco[i] = [cx + dx * horizontal, cy + dy * vertical, 0.0];
+                            }
+                            let mut converted = coco_to_h36m(coco);
+                            for p in &mut converted[..8] {
+                                p[2] = 0.0;
+                            }
+                            for p in &mut converted {
+                                p[0] = p[0] / width as f32 * 2.0 - 1.0;
+                                p[1] = p[1] / width as f32 * 2.0 - height as f32 / width as f32;
+                            }
+                            *lifter.history.frames.back_mut().unwrap() = converted;
+                        }
+                    }
+                    ensure!(
+                        lifter.history.frames.len() == FRAMES,
+                        "Incomplete centered context"
+                    );
+                    Some(lifter.infer_history(FRAMES / 2, 0.3)?)
+                } else {
+                    lifter.infer(&points, bbox, Size::new(width, height), 0.3)?
+                };
+                if metric {
+                    if let Some(pose) = &mut pose {
+                        let native = &person["pose3d"]["joints"];
+                        let a = &pose.joints[11];
+                        let b = &pose.joints[14];
+                        let center = [(a.x + b.x) / 2.0, (a.y + b.y) / 2.0, (a.z + b.z) / 2.0];
+                        let scale = body_width as f32
+                            / (a.x - b.x).hypot(a.y - b.y).hypot(a.z - b.z).max(1e-6);
+                        let anchor = [
+                            native[8]["x"].as_f64().unwrap() as f32,
+                            native[8]["y"].as_f64().unwrap() as f32,
+                            native[8]["z"].as_f64().unwrap() as f32,
+                        ];
+                        for joint in &mut pose.joints {
+                            joint.x = (joint.x - center[0]) * scale + anchor[0];
+                            joint.y = (joint.y - center[1]) * scale + anchor[1];
+                            joint.z = (joint.z - center[2]) * scale + anchor[2];
+                        }
+                        // Keep the native physical shoulder-center/head anchors;
+                        // model H36M thorax/neck slots have different semantics.
+                        for i in [8, 9, 10] {
+                            pose.joints[i].x = native[i]["x"].as_f64().unwrap() as f32;
+                            pose.joints[i].y = native[i]["y"].as_f64().unwrap() as f32;
+                            pose.joints[i].z = native[i]["z"].as_f64().unwrap() as f32;
+                            pose.joints[i].input_score =
+                                native[i]["input_score"].as_f64().unwrap() as f32;
+                        }
+                        pose.ear_head = true;
+                        pose.model = "MotionAGFormer-NativeScale-Diagnostic";
+                        pose.units = "estimated_meters";
+                    }
+                }
+                if let Some(pose) = &pose {
+                    let hands: Vec<crate::details::HandPose> =
+                        serde_json::from_value(person["hands"].clone())?;
+                    let head = serde_json::from_value(person["head"].clone())?;
+                    recorder.observe(
+                        n,
+                        times[n as usize],
+                        pose,
+                        &points,
+                        &hands,
+                        head,
+                        bbox,
+                        Size::new(width, height),
+                        0.3,
+                        None,
+                    );
+                }
+                person["pose3d"] = serde_json::to_value(pose)?;
+            }
+            serde_json::to_writer(&mut output, &row)?;
+            output.write_all(b"\n")?;
+        }
+        output.flush()?;
+        recorder.set_timing(crate::twin::RecordingTiming {
+            fps: meta["fps"].as_f64().unwrap(),
+            frame_count: times.len() as u64,
+            timestamps_seconds: times,
+            source_video: Some("source.mp4".into()),
+            trim_start_seconds: 3.0,
+            trim_end_seconds: 3.0,
+            upper_body: true,
+            assume_upright_torso: true,
+        });
+        recorder.save(&directory.join(format!("{tag}-twin.json")))?;
+        Ok(())
+    }
     fn points() -> Vec<Keypoint> {
         (0..17)
             .map(|i| Keypoint {

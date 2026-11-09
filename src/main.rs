@@ -1,19 +1,29 @@
+mod accelerated;
 mod angles;
+mod avatar;
 mod bundle;
+mod depth_path;
 mod details;
 mod detection_cache;
 mod detector;
+mod heading_path;
+mod image_motion;
+mod joint_tracking;
 mod landmarks;
 mod live_preview;
 mod mediapipe;
 mod motion3d;
+mod occlusion;
 mod palm;
 mod pose;
+mod preview_tracking;
 mod recording;
 mod replay;
 mod scope;
 mod tracking;
 mod twin;
+#[cfg(test)]
+mod videopose3d;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -78,6 +88,24 @@ struct Args {
     head_orientation: bool,
     #[arg(long, default_value = "models/mediapipe-pose.onnx")]
     model: PathBuf,
+    /// Optional RTMPose/RTMW arm refinement; recorded/file passes auto-use models/rtmpose-m.onnx when present.
+    #[arg(long, conflicts_with = "no_arm_refinement")]
+    arm_model: Option<PathBuf>,
+    /// Skip the extra arm inference pass (faster, less robust with motion blur).
+    #[arg(long)]
+    no_arm_refinement: bool,
+    /// Disable joint outlier rejection, image gap tracking and sequence stabilization.
+    #[arg(long)]
+    no_stabilization: bool,
+    /// Keep rejection and sequence fitting, but disable adaptive jitter filtering.
+    #[arg(long)]
+    no_smoothing: bool,
+    /// OpenCV CPU thread budget; defaults to at most four to leave room for live tracking.
+    #[arg(long, value_parser=clap::value_parser!(i32).range(1..=32))]
+    opencv_threads: Option<i32>,
+    /// Use OpenCV CPU inference instead of the native macOS execution provider.
+    #[arg(long)]
+    no_acceleration: bool,
     /// MotionAGFormer-XS H36M ONNX export for 3D body lifting.
     #[arg(long, default_value = "models/motionagformer-xs.onnx")]
     motion_model: PathBuf,
@@ -202,6 +230,18 @@ struct PersonPose {
     /// Null for manual/full-frame crops.
     detection_score: Option<f32>,
     keypoints: Vec<Keypoint>,
+    /// Original landmarks before continuity gates and adaptive filtering.
+    observed_keypoints: Vec<Keypoint>,
+    /// Native coordinates stay in pose3d; preserve their confidence before new continuity gates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_native_scores: Option<Vec<f32>>,
+    joint_tracking: Vec<joint_tracking::JointUpdate>,
+    predicted_joints: Vec<Keypoint>,
+    /// Body observations before independent hand refinement.
+    body_wrists: [Keypoint; 2],
+    /// COCO indices refined by RTM before final occlusion gates and dedicated hand merging.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    arm_refined: Vec<usize>,
     angles: Vec<angles::JointAngle>,
     pose3d: Option<motion3d::Pose3d>,
     twin: Option<twin::TwinPreview>,
@@ -209,6 +249,10 @@ struct PersonPose {
     hands: Vec<details::HandPose>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     predicted_hands: Vec<details::HandPose>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_torso_scale: Option<f64>,
+    image_torso_reference_reset: bool,
+    image_torso_span: usize,
     head: Option<details::HeadPose>,
 }
 
@@ -276,18 +320,51 @@ fn process(
         if !args.full_body {
             scope::mask_lower(&mut keypoints);
         }
-        let body_wrists = [keypoints[9], keypoints[10]];
+        let mut occluded = if estimator.is_mediapipe() {
+            occlusion::mask_arm_overlap(&mut keypoints, frame.size()?)
+        } else {
+            [false; 17]
+        };
+        let hand_references = hand_model
+            .as_ref()
+            .map(|model| model.occlusion_references(time_seconds))
+            .unwrap_or_default();
         let hands = match hand_model.as_mut() {
-            Some(model) => model.infer(frame, &keypoints, time_seconds)?,
+            Some(model) => model.infer(
+                frame,
+                &keypoints,
+                time_seconds,
+                Some(bbox),
+                estimator.hand_crop_wrists().as_ref(),
+            )?,
             None => Vec::new(),
         };
+        if estimator.is_mediapipe() {
+            let recent = occlusion::mask_recent_hand_overlap(
+                &mut keypoints,
+                frame.size()?,
+                &hand_references,
+            );
+            for i in 0..17 {
+                occluded[i] |= recent[i];
+            }
+        }
+        let body_wrists = [keypoints[9], keypoints[10]];
         let predicted_hands = hand_model
             .as_ref()
             .map(|model| model.predictions(time_seconds))
             .unwrap_or_default();
+        estimator.confirm_hands(&hands);
         if estimator.is_mediapipe() {
-            details::merge_hand_landmarks(&mut keypoints, &hands);
+            match &hand_model {
+                Some(model) => model.merge_landmarks(&mut keypoints, &hands, time_seconds),
+                None => details::merge_hand_landmarks(&mut keypoints, &hands),
+            }
         }
+        let observed_keypoints = keypoints.clone();
+        let observed_native_scores = estimator.observed_native_scores();
+        let joint_frame =
+            estimator.stabilize(frame, &mut keypoints, time_seconds, bbox, &hands, &occluded)?;
         let head = if args.head_orientation {
             details::head_pose(&keypoints, args.threshold)
         } else {
@@ -310,20 +387,31 @@ fn process(
         };
         if estimator.is_mediapipe() {
             if let Some(pose) = &mut pose3d {
+                for (coco, joint) in [(7, 12), (9, 13), (8, 15), (10, 16)] {
+                    if occluded[coco] {
+                        pose.joints[joint].input_score = 0.0;
+                    }
+                }
                 let width =
                     (keypoints[5].x - keypoints[6].x).hypot(keypoints[5].y - keypoints[6].y);
                 for hand in &hands {
                     let side = if hand.side == "left" { 0 } else { 1 };
                     let old = body_wrists[side];
-                    let wrist = hand.image_landmarks[0];
+                    let measured = keypoints[if side == 0 { 9 } else { 10 }];
+                    let wrist = [measured.x, measured.y];
                     if (old.x - wrist[0]).hypot(old.y - wrist[1]) > (width * 0.3).max(40.0) {
                         // The hand detector has located the wrist elsewhere. Keep
                         // its reliable 2D constraint without trusting stale body depth.
                         pose.joints[if side == 0 { 13 } else { 16 }].input_score = 0.0;
                     }
                 }
+                pose.angles = motion3d::angles3d(&pose.joints, args.threshold);
             }
         }
+        let image_torso_scale = estimator.image_torso_scale();
+        let image_torso_reference_reset = estimator.image_torso_reference_reset();
+        let image_torso_span = estimator.image_torso_span();
+        twin_recorder.set_image_torso_scale(image_torso_scale, image_torso_span);
         let twin = pose3d.as_ref().and_then(|pose| {
             twin_recorder.observe(
                 index,
@@ -359,12 +447,21 @@ fn process(
             bbox,
             detection_score,
             keypoints,
+            body_wrists,
+            observed_keypoints,
+            observed_native_scores,
+            joint_tracking: joint_frame.updates,
+            predicted_joints: joint_frame.predicted,
+            arm_refined: estimator.arm_refined().to_vec(),
             angles,
             pose3d,
             twin,
             tracking,
             hands,
             predicted_hands,
+            image_torso_scale,
+            image_torso_reference_reset,
+            image_torso_span,
             head,
         });
     }
@@ -394,6 +491,7 @@ fn process(
         } else {
             pose::draw(frame, &person.keypoints, args.threshold)?;
         }
+        joint_tracking::draw_predictions(frame, &person.predicted_joints)?;
         details::draw_hands(frame, &person.hands)?;
         details::draw_predicted_hands(frame, &person.predicted_hands)?;
         let b = person.bbox;
@@ -465,8 +563,18 @@ fn process(
     Ok(())
 }
 
+fn opencv_thread_budget(requested: Option<i32>) -> i32 {
+    requested.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(4) as i32)
+            .unwrap_or(1)
+    })
+}
+
 fn main() -> Result<()> {
     let mut args = Args::parse();
+    opencv::core::set_num_threads(opencv_thread_budget(args.opencv_threads))?;
+    accelerated::set_enabled(!args.no_acceleration);
     if let Some(path) = &args.replay {
         let output = args
             .output
@@ -502,6 +610,28 @@ fn main() -> Result<()> {
     }
     let mut estimator = PoseEstimator::new(&args.model)?;
     estimator.set_upper_body(!args.full_body);
+    estimator.set_stabilization(!args.no_stabilization, !args.no_smoothing);
+    let default_arm_model = PathBuf::from("models/rtmpose-m.onnx");
+    let arm_model = args.arm_model.as_ref().or_else(|| {
+        (!args.no_arm_refinement
+            && (args.input.is_some() || args.record.is_some())
+            && default_arm_model.is_file())
+        .then_some(&default_arm_model)
+    });
+    if estimator.is_mediapipe() {
+        if let Some(path) = arm_model {
+            estimator.set_arm_refiner(path)?;
+            eprintln!(
+                "Arm image refinement: {} (extra inference per processed frame)",
+                path.display()
+            );
+        }
+    } else {
+        ensure!(
+            args.arm_model.is_none(),
+            "--arm-model requires a MediaPipe primary model"
+        );
+    }
     let session_workspace = if args.record.is_some() {
         Some(tempfile::tempdir()?)
     } else {
@@ -512,7 +642,7 @@ fn main() -> Result<()> {
             !target.is_dir(),
             "--record now takes one .twin save file. Use --record by itself for output/recording.twin."
         );
-        for input in args.input.iter().chain([
+        for input in args.input.iter().chain(arm_model).chain([
             &args.model,
             &args.motion_model,
             &args.hand_model,
@@ -558,6 +688,11 @@ fn main() -> Result<()> {
         } else {
             Some(live_preview::LivePreview::new(
                 &args.model,
+                if estimator.is_mediapipe() {
+                    arm_model.map(|p| p.as_path())
+                } else {
+                    None
+                },
                 (!args.no_hands).then_some(args.hand_model.as_path()),
                 if args.no_detection || args.bbox.is_some() {
                     None
@@ -572,6 +707,8 @@ fn main() -> Result<()> {
                 args.detection_interval,
                 args.threshold,
                 args.full_body,
+                !args.no_stabilization,
+                !args.no_smoothing,
             )?)
         };
         let mut draw_preview = |frame: &mut Mat, index: u64| -> Result<()> {
@@ -603,9 +740,9 @@ fn main() -> Result<()> {
         args.camera = None;
         args.twin_output = directory.join("twin.json");
         args.output = Some(directory.join("tracked.mp4"));
-        if args.json.is_some() {
-            args.json = Some(directory.join("poses.jsonl"));
-        }
+        // Keep observations beside the fit inside the single save, so tracking
+        // failures can be distinguished from IK errors without another inference.
+        args.json = Some(directory.join("poses.jsonl"));
         // The recording preview already closed. Analyze every saved frame without a second window.
         args.no_display = true;
         Some(captured)
@@ -623,7 +760,7 @@ fn main() -> Result<()> {
         .chain(args.json.iter())
         .chain(std::iter::once(&args.twin_output))
     {
-        for source in args.input.iter().chain([
+        for source in args.input.iter().chain(arm_model).chain([
             &args.model,
             &args.detector_model,
             &args.motion_model,
@@ -676,6 +813,7 @@ fn main() -> Result<()> {
     };
     let mut twin_recorder = twin::TwinRecorder::default();
     twin_recorder.set_upright_torso(!args.free_torso);
+    twin_recorder.set_stabilization(!args.no_stabilization, !args.no_smoothing);
     if let Some(lifter) = lifter.as_mut() {
         lifter.set_upper_body(!args.full_body);
     }

@@ -1,5 +1,5 @@
-//! Model-free skeletal-twin playback: deserialize shared offsets + local quaternions,
-//! reconstruct with FK, and render from an orbitable perspective camera.
+//! Human-twin playback: reconstruct the existing rig with FK and render a
+//! baseline body surface or skeleton from an orbitable perspective camera.
 use crate::details::{HAND_PARENT, HandFrame, HandShape, HeadPose};
 use anyhow::{Context, Result, ensure};
 use nalgebra::{Quaternion, Rotation3, UnitQuaternion, Vector3};
@@ -52,6 +52,10 @@ struct Subject {
 }
 #[derive(Clone, Deserialize)]
 struct Person {
+    #[serde(default)]
+    ear_head: bool,
+    #[serde(default)]
+    head_radius: Option<f64>,
     rest_offsets: Vec<[f64; 3]>,
     #[serde(default)]
     hands: BTreeMap<String, HandShape>,
@@ -68,6 +72,8 @@ struct Frame {
     prediction: Prediction,
     frame: u64,
     root_position: [f64; 3],
+    #[serde(default)]
+    root_depth_observed: Option<bool>,
     root_orientation_xyzw: [f64; 4],
     joint_rotations: Vec<JointRotation>,
     #[serde(default)]
@@ -120,7 +126,7 @@ impl Recording {
         )
         .context("Invalid skeletal twin JSON")?;
         ensure!(
-            record.schema_version == 1,
+            matches!(record.schema_version, 1 | 2),
             "Unsupported skeletal twin schema version"
         );
         ensure!(
@@ -128,11 +134,34 @@ impl Recording {
             "Unsupported quaternion convention"
         );
         ensure!(
-            record.joint_names.len() == N && record.parents.len() == N,
-            "Expected a 17-joint twin hierarchy"
+            matches!(record.joint_names.len(), 17 | 18)
+                && record.parents.len() == record.joint_names.len(),
+            "Expected a 17- or 18-joint twin hierarchy"
         );
+        ensure!(
+            record.joint_names.len() == if record.schema_version == 1 { 17 } else { 18 },
+            "Joint count does not match twin schema version"
+        );
+        if record.joint_names.len() == 18 {
+            ensure!(
+                record.joint_names[0] == "pelvis",
+                "Body root must be the pelvis"
+            );
+            ensure!(
+                crate::motion3d::NAMES
+                    .iter()
+                    .chain(std::iter::once(&"head_pivot"))
+                    .all(|name| record
+                        .joint_names
+                        .iter()
+                        .filter(|n| n.as_str() == *name)
+                        .count()
+                        == 1),
+                "Missing or duplicate body joint in head-pivot hierarchy"
+            );
+        }
         ensure!(record.parents[0].is_none(), "Root must have no parent");
-        for i in 1..N {
+        for i in 1..record.joint_names.len() {
             ensure!(
                 record.parents[i].is_some_and(|p| p < i),
                 "Hierarchy must be in parent-before-child order"
@@ -140,7 +169,7 @@ impl Recording {
         }
         for subject in &record.subjects {
             ensure!(
-                subject.person.rest_offsets.len() == N,
+                subject.person.rest_offsets.len() == record.joint_names.len(),
                 "Missing shared rest offsets"
             );
             ensure!(
@@ -194,7 +223,7 @@ impl Recording {
                     }
                 }
                 ensure!(
-                    f.joint_rotations.len() == N,
+                    f.joint_rotations.len() == record.joint_names.len(),
                     "Missing per-frame joint rotations"
                 );
                 for (i, q) in f.joint_rotations.iter().enumerate() {
@@ -235,15 +264,15 @@ impl Recording {
     }
 
     fn positions(&self, subject: &Subject, frame: &Frame, follow: bool) -> Result<[V; N]> {
-        let mut positions = [V::zeros(); N];
-        let mut world = [Q::identity(); N];
+        let mut positions = vec![V::zeros(); self.joint_names.len()];
+        let mut world = vec![Q::identity(); self.joint_names.len()];
         positions[0] = if follow {
             V::zeros()
         } else {
             vector(frame.root_position)
         };
         world[0] = rotation(frame.root_orientation_xyzw)?;
-        for i in 1..N {
+        for i in 1..self.joint_names.len() {
             let parent = self.parents[i].unwrap();
             positions[i] =
                 positions[parent] + world[parent] * vector(subject.person.rest_offsets[i]);
@@ -251,7 +280,47 @@ impl Recording {
                 *(world[parent] * rotation(frame.joint_rotations[i].quaternion_xyzw)?).quaternion(),
             );
         }
-        Ok(positions)
+        Ok(std::array::from_fn(|i| positions[self.body_index(i)]))
+    }
+    fn body_index(&self, i: usize) -> usize {
+        if self.joint_names.len() == N {
+            i
+        } else {
+            self.joint_names
+                .iter()
+                .position(|n| n == crate::motion3d::NAMES[i])
+                .unwrap()
+        }
+    }
+    fn body_parent(&self, i: usize) -> usize {
+        if self.joint_names.len() == N {
+            self.parents[i].unwrap()
+        } else {
+            let mut parent = self.parents[self.body_index(i)].unwrap();
+            while self.joint_names[parent] == "head_pivot" {
+                parent = self.parents[parent].unwrap();
+            }
+            crate::motion3d::NAMES
+                .iter()
+                .position(|name| *name == self.joint_names[parent])
+                .unwrap()
+        }
+    }
+    fn body_joint<'a>(&self, frame: &'a Frame, i: usize) -> &'a JointRotation {
+        &frame.joint_rotations[self.body_index(i)]
+    }
+    fn body_rotation(&self, frame: &Frame, i: usize) -> Result<Q> {
+        let mut index = self.body_index(i);
+        let mut chain = Vec::new();
+        while index != 0 {
+            chain.push(index);
+            index = self.parents[index].unwrap();
+        }
+        let mut world = rotation(frame.root_orientation_xyzw)?;
+        for index in chain.into_iter().rev() {
+            world *= rotation(frame.joint_rotations[index].quaternion_xyzw)?;
+        }
+        Ok(world)
     }
     fn time(&self, frame: u64, fps: f64, override_fps: bool) -> f64 {
         if !override_fps {
@@ -308,19 +377,105 @@ fn bounds(
 ) -> Result<Bounds> {
     let mut min = V::repeat(f64::INFINITY);
     let mut max = V::repeat(f64::NEG_INFINITY);
+    let mut floor = f64::NEG_INFINITY;
     for subject in subjects {
+        let width = vector(subject.person.rest_offsets[record.body_index(11)]).norm() * 2.0;
         for frame in &subject.frames {
-            for p in &display_positions(record, subject, frame, follow, upper_body)? {
-                min = min.inf(p);
-                max = max.sup(p);
+            let positions = display_positions(record, subject, frame, follow, upper_body)?;
+            floor = floor.max(positions[3].y).max(positions[6].y);
+            for p in &positions {
+                min = min.inf(&(p - V::repeat(width * 0.13)));
+                max = max.sup(&(p + V::repeat(width * 0.13)));
             }
+            for hand in hand_positions(subject, frame, &positions)? {
+                for p in hand {
+                    min = min.inf(&(p - V::repeat(width * 0.025)));
+                    max = max.sup(&(p + V::repeat(width * 0.025)));
+                }
+            }
+            let (head, _, radius, _) = head_geometry(record, subject, frame, &positions)?;
+            min = min.inf(&(head - V::repeat(radius * 1.3)));
+            max = max.sup(&(head + V::repeat(radius * 1.3)));
         }
     }
     Ok(Bounds {
         center: (min + max) / 2.0,
         radius: ((max - min).norm() / 2.0).max(0.1),
-        floor: max.y,
+        floor,
     })
+}
+fn head_geometry(
+    record: &Recording,
+    subject: &Subject,
+    pose: &Frame,
+    positions: &[V; N],
+) -> Result<(V, Q, f64, bool)> {
+    // Head position follows the 3D body; sparse face fitting supplies orientation when available.
+    let mut orientation = if let Some(head) = &pose.head {
+        rotation(head.orientation_xyzw)?
+    } else {
+        record.body_rotation(pose, 9)?
+    };
+    let center = if subject.person.ear_head {
+        positions[10]
+    } else {
+        (positions[9] + positions[10]) / 2.0
+    };
+    if subject.person.ear_head && pose.head.is_none() {
+        let forward = positions[9] - center;
+        if forward.norm() > 1e-6 {
+            let z = -forward.normalize();
+            let x = V::y().cross(&z);
+            if x.norm() > 1e-6 {
+                let x = x.normalize();
+                let y = z.cross(&x).normalize();
+                orientation = UnitQuaternion::from_rotation_matrix(
+                    &Rotation3::from_matrix_unchecked(nalgebra::Matrix3::from_columns(&[x, y, z])),
+                );
+            }
+        }
+    }
+    let head_unobserved = pose.prediction.head
+        || [9, 10].iter().any(|&i| {
+            record
+                .body_joint(pose, i)
+                .confidence
+                .is_some_and(|s| s < 0.3)
+        });
+    let radius = if subject.person.ear_head {
+        subject
+            .person
+            .head_radius
+            .filter(|r| r.is_finite() && *r > 0.0)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| ((positions[10] - positions[9]).norm() * 0.85).max(0.015));
+
+    Ok((center, orientation, radius, head_unobserved))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Surface {
+    Body,
+    Skeleton,
+    Overlay,
+}
+impl Surface {
+    fn next(self) -> Self {
+        match self {
+            Self::Body => Self::Skeleton,
+            Self::Skeleton => Self::Overlay,
+            Self::Overlay => Self::Body,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Body => "Body",
+            Self::Skeleton => "Skeleton",
+            Self::Overlay => "Body + skeleton",
+        }
+    }
 }
 struct View {
     yaw: f64,
@@ -329,16 +484,18 @@ struct View {
     follow: bool,
     names: bool,
     upper_body: bool,
+    surface: Surface,
 }
 impl Default for View {
     fn default() -> Self {
         Self {
-            yaw: -0.55,
-            pitch: 0.22,
-            zoom: 1.0,
-            follow: true,
+            yaw: 0.0,
+            pitch: 0.0,
+            zoom: 1.6,
+            follow: false,
             names: false,
             upper_body: true,
+            surface: Surface::Body,
         }
     }
 }
@@ -352,6 +509,7 @@ fn render(
     seconds: f64,
     speed: f64,
     paused: bool,
+    sampled: Option<&Frame>,
 ) -> Result<Mat> {
     let size = Size::new(1024, 768);
     let mut image = Mat::new_rows_cols_with_default(
@@ -430,150 +588,198 @@ fn render(
             }
         }
     }
-    let current = subjects.iter().find_map(|subject| {
-        subject
-            .frames
-            .binary_search_by_key(&frame, |f| f.frame)
-            .ok()
-            .map(|i| (*subject, &subject.frames[i]))
+    let current = sampled.map(|pose| (subjects[0], pose)).or_else(|| {
+        subjects.iter().find_map(|subject| {
+            subject
+                .frames
+                .binary_search_by_key(&frame, |f| f.frame)
+                .ok()
+                .map(|i| (*subject, &subject.frames[i]))
+        })
     });
     if let Some((subject, pose)) = current {
         let positions = display_positions(record, subject, pose, view.follow, view.upper_body)?;
-        for i in 1..N {
-            let unobserved = (view.upper_body
-                && (!crate::scope::body_upper(i)
-                    || !crate::scope::body_upper(record.parents[i].unwrap())))
-                || pose.joint_rotations[i].confidence.is_some_and(|s| s < 0.3)
-                || pose.joint_rotations[record.parents[i].unwrap()]
-                    .confidence
-                    .is_some_and(|s| s < 0.3);
-            let color = if unobserved {
-                Scalar::all(100.0)
-            } else if pose.prediction.body {
-                Scalar::new(165.0, 165.0, 165.0, 0.0)
-            } else if record.joint_names[i].starts_with("left_") {
-                Scalar::new(60.0, 180.0, 255.0, 0.0)
-            } else if record.joint_names[i].starts_with("right_") {
-                Scalar::new(255.0, 205.0, 65.0, 0.0)
-            } else {
-                Scalar::all(220.0)
-            };
-            if let (Some(a), Some(b)) = (
-                project(positions[record.parents[i].unwrap()]),
-                project(positions[i]),
-            ) {
-                imgproc::line(
-                    &mut image,
-                    a,
-                    b,
-                    color,
-                    if unobserved { 2 } else { 6 },
-                    imgproc::LINE_AA,
-                    0,
-                )?;
-            }
-        }
-        // Head position follows the 3D body; sparse face fitting supplies orientation when available.
-        let orientation = if let Some(head) = &pose.head {
-            rotation(head.orientation_xyzw)?
-        } else {
-            rotation(pose.root_orientation_xyzw)?
-                * rotation(pose.joint_rotations[7].quaternion_xyzw)?
-                * rotation(pose.joint_rotations[8].quaternion_xyzw)?
-                * rotation(pose.joint_rotations[9].quaternion_xyzw)?
-        };
-        let center = (positions[9] + positions[10]) / 2.0;
-        let head_unobserved = pose.prediction.head
-            || [9, 10]
+        if view.surface != Surface::Skeleton {
+            let (head_center, head_orientation, head_radius, head_unobserved) =
+                head_geometry(record, subject, pose, &positions)?;
+            let hands: Vec<_> = pose
+                .hands
                 .iter()
-                .any(|&i| pose.joint_rotations[i].confidence.is_some_and(|s| s < 0.3));
-        let radius = ((positions[10] - positions[9]).norm() * 0.85).max(0.015);
-        let head_point = |p: V| project(center + orientation * p);
-        for plane in 0..3 {
-            let mut previous = None;
-            for step in 0..=32 {
-                let angle = step as f64 * std::f64::consts::TAU / 32.0;
-                let (a, b) = (angle.cos() * radius, angle.sin() * radius);
-                let p = match plane {
-                    0 => V::new(a * 0.8, b * 1.1, 0.0),
-                    1 => V::new(a * 0.8, 0.0, b * 0.8),
-                    _ => V::new(0.0, a * 1.1, b * 0.8),
+                .zip(hand_positions(subject, pose, &positions)?)
+                .map(|(hand, points)| (hand.side == "left", points))
+                .collect();
+            let mut observed = std::array::from_fn(|i| {
+                !pose.prediction.body
+                    && (!view.upper_body || crate::scope::body_upper(i))
+                    && record
+                        .body_joint(pose, i)
+                        .confidence
+                        .is_none_or(|c| c >= 0.3)
+            });
+            observed[9] = !head_unobserved;
+            observed[10] = !head_unobserved;
+            let body = crate::avatar::Body {
+                joints: &positions,
+                shoulder_width: vector(subject.person.rest_offsets[record.body_index(11)]).norm()
+                    * 2.0,
+                pelvis_width: vector(subject.person.rest_offsets[record.body_index(1)]).norm()
+                    * 2.0,
+                orientation: rotation(pose.root_orientation_xyzw)?,
+                head_center,
+                head_orientation,
+                head_radius,
+                observed,
+                hands: &hands,
+            };
+            crate::avatar::Mesh::human(&body).draw(&mut image, &orbit, scene.center, distance)?;
+        }
+        if view.surface != Surface::Body || view.names {
+            for i in 1..N {
+                // Nose/head-center anchors fit the observations; they are not
+                // anatomical neck bones. Draw an inferred neck below the skull.
+                if subject.person.ear_head && [9, 10].contains(&i) {
+                    continue;
+                }
+                let unobserved = (view.upper_body
+                    && (!crate::scope::body_upper(i)
+                        || !crate::scope::body_upper(record.body_parent(i))))
+                    || record
+                        .body_joint(pose, i)
+                        .confidence
+                        .is_some_and(|s| s < 0.3)
+                    || record
+                        .body_joint(pose, record.body_parent(i))
+                        .confidence
+                        .is_some_and(|s| s < 0.3);
+                let color = if unobserved {
+                    Scalar::all(100.0)
+                } else if pose.prediction.body {
+                    Scalar::new(165.0, 165.0, 165.0, 0.0)
+                } else if record.joint_names[record.body_index(i)].starts_with("left_") {
+                    Scalar::new(60.0, 180.0, 255.0, 0.0)
+                } else if record.joint_names[record.body_index(i)].starts_with("right_") {
+                    Scalar::new(255.0, 205.0, 65.0, 0.0)
+                } else {
+                    Scalar::all(220.0)
                 };
-                let current = head_point(p);
-                if let (Some(a), Some(b)) = (previous, current) {
+                if let (Some(a), Some(b)) = (
+                    project(positions[record.body_parent(i)]),
+                    project(positions[i]),
+                ) {
                     imgproc::line(
                         &mut image,
                         a,
                         b,
-                        Scalar::all(if head_unobserved { 145.0 } else { 225.0 }),
-                        2,
+                        color,
+                        if unobserved { 2 } else { 6 },
                         imgproc::LINE_AA,
                         0,
                     )?;
                 }
-                previous = current;
             }
-        }
-        if let (Some(a), Some(b)) = (project(center), head_point(V::new(0.0, 0.0, -radius * 1.5))) {
-            imgproc::line(
-                &mut image,
-                a,
-                b,
-                if head_unobserved {
-                    Scalar::all(145.0)
-                } else {
-                    Scalar::new(90.0, 240.0, 90.0, 0.0)
-                },
-                3,
-                imgproc::LINE_AA,
-                0,
-            )?;
-        }
-        for hand in hand_positions(subject, pose, &positions)? {
-            let color = if pose.prediction.hands {
-                Scalar::all(150.0)
-            } else {
-                Scalar::new(220.0, 90.0, 230.0, 0.0)
-            };
-            for i in 1..21 {
-                if let (Some(a), Some(b)) = (project(hand[HAND_PARENT[i]]), project(hand[i])) {
-                    imgproc::line(&mut image, a, b, color, 2, imgproc::LINE_AA, 0)?;
-                }
-                if let Some(p) = project(hand[i]) {
-                    imgproc::circle(&mut image, p, 2, color, -1, imgproc::LINE_AA, 0)?;
+            let (center, orientation, radius, head_unobserved) =
+                head_geometry(record, subject, pose, &positions)?;
+            if subject.person.ear_head {
+                let neck = center + orientation * V::new(0.0, radius * 0.85, 0.0);
+                if let (Some(a), Some(b)) = (project(positions[8]), project(neck)) {
+                    imgproc::line(&mut image, a, b, Scalar::all(145.0), 3, imgproc::LINE_AA, 0)?;
                 }
             }
-            for pair in [0, 5, 9, 13, 17, 0].windows(2) {
-                if let (Some(a), Some(b)) = (project(hand[pair[0]]), project(hand[pair[1]])) {
-                    imgproc::line(&mut image, a, b, color, 2, imgproc::LINE_AA, 0)?;
+            let head_point = |p: V| project(center + orientation * p);
+            for plane in 0..3 {
+                let mut previous = None;
+                for step in 0..=32 {
+                    let angle = step as f64 * std::f64::consts::TAU / 32.0;
+                    let (a, b) = (angle.cos() * radius, angle.sin() * radius);
+                    let p = match plane {
+                        0 => V::new(a * 0.8, b * 1.1, 0.0),
+                        1 => V::new(a * 0.8, 0.0, b * 0.8),
+                        _ => V::new(0.0, a * 1.1, b * 0.8),
+                    };
+                    let current = head_point(p);
+                    if let (Some(a), Some(b)) = (previous, current) {
+                        imgproc::line(
+                            &mut image,
+                            a,
+                            b,
+                            Scalar::all(if head_unobserved { 145.0 } else { 225.0 }),
+                            2,
+                            imgproc::LINE_AA,
+                            0,
+                        )?;
+                    }
+                    previous = current;
                 }
             }
-        }
-        for (i, p) in positions.iter().enumerate() {
-            let unobserved = (view.upper_body && !crate::scope::body_upper(i))
-                || pose.joint_rotations[i].confidence.is_some_and(|s| s < 0.3);
-            if let Some(p) = project(*p) {
-                imgproc::circle(
+            if let (Some(a), Some(b)) =
+                (project(center), head_point(V::new(0.0, 0.0, -radius * 1.5)))
+            {
+                imgproc::line(
                     &mut image,
-                    p,
-                    6,
-                    Scalar::all(if unobserved { 100.0 } else { 245.0 }),
-                    if unobserved { 1 } else { -1 },
+                    a,
+                    b,
+                    if head_unobserved {
+                        Scalar::all(145.0)
+                    } else {
+                        Scalar::new(90.0, 240.0, 90.0, 0.0)
+                    },
+                    3,
                     imgproc::LINE_AA,
                     0,
                 )?;
-                if view.names {
-                    imgproc::put_text(
+            }
+            for hand in hand_positions(subject, pose, &positions)? {
+                let color = if pose.prediction.hands {
+                    Scalar::all(150.0)
+                } else {
+                    Scalar::new(220.0, 90.0, 230.0, 0.0)
+                };
+                for i in 1..21 {
+                    if let (Some(a), Some(b)) = (project(hand[HAND_PARENT[i]]), project(hand[i])) {
+                        imgproc::line(&mut image, a, b, color, 2, imgproc::LINE_AA, 0)?;
+                    }
+                    if let Some(p) = project(hand[i]) {
+                        imgproc::circle(&mut image, p, 2, color, -1, imgproc::LINE_AA, 0)?;
+                    }
+                }
+                for pair in [0, 5, 9, 13, 17, 0].windows(2) {
+                    if let (Some(a), Some(b)) = (project(hand[pair[0]]), project(hand[pair[1]])) {
+                        imgproc::line(&mut image, a, b, color, 2, imgproc::LINE_AA, 0)?;
+                    }
+                }
+            }
+            for (i, p) in positions.iter().enumerate() {
+                if subject.person.ear_head && [9, 10].contains(&i) {
+                    continue;
+                }
+                let unobserved = (view.upper_body && !crate::scope::body_upper(i))
+                    || record
+                        .body_joint(pose, i)
+                        .confidence
+                        .is_some_and(|s| s < 0.3);
+                if let Some(p) = project(*p) {
+                    imgproc::circle(
                         &mut image,
-                        &record.joint_names[i],
-                        Point::new(p.x + 8, p.y - 6),
-                        imgproc::FONT_HERSHEY_SIMPLEX,
-                        0.38,
-                        Scalar::all(235.0),
-                        1,
+                        p,
+                        6,
+                        Scalar::all(if unobserved { 100.0 } else { 245.0 }),
+                        if unobserved { 1 } else { -1 },
                         imgproc::LINE_AA,
-                        false,
+                        0,
                     )?;
+                    if view.names {
+                        imgproc::put_text(
+                            &mut image,
+                            &record.joint_names[record.body_index(i)],
+                            Point::new(p.x + 8, p.y - 6),
+                            imgproc::FONT_HERSHEY_SIMPLEX,
+                            0.38,
+                            Scalar::all(235.0),
+                            1,
+                            imgproc::LINE_AA,
+                            false,
+                        )?;
+                    }
                 }
             }
         }
@@ -598,7 +804,7 @@ fn render(
     for (text, y, scale) in [
         (
             format!(
-                "Skeletal twin | subject {} | frame {} | {:.2}s",
+                "Human twin | subject {} | frame {} | {:.2}s",
                 current
                     .map(|(s, _)| s.subject_segment.to_string())
                     .unwrap_or_else(|| "none".into()),
@@ -620,20 +826,32 @@ fn render(
                 {
                     "Predicted motion"
                 } else {
-                    "Observed fit"
+                    if current.is_some_and(|(_, p)| p.root_depth_observed == Some(false)) {
+                        "Observed fit | depth inferred"
+                    } else {
+                        "Observed fit"
+                    }
                 }
             ),
             58,
             0.5,
         ),
-        ("Gray: unobserved or predicted joints".into(), 82, 0.45),
+        (
+            format!(
+                "{} | Baseline body shape | gray: unobserved or predicted",
+                view.surface.name()
+            ),
+            82,
+            0.45,
+        ),
         (
             "Space play/pause | J/L step | A/D orbit | W/S tilt | +/- zoom".into(),
             716,
             0.45,
         ),
         (
-            "F root motion | N names | 1/2/3 view | R reset | [/] speed | Q quit".into(),
+            "B body/skeleton | F root motion | N names | 1/2/3 view | R reset | [/] speed | Q quit"
+                .into(),
             743,
             0.45,
         ),
@@ -704,6 +922,86 @@ fn blend_body_relative(
     let q = rotation(root_now)? * a.slerp(&b, t);
     let q = q.quaternion();
     Ok([q.i, q.j, q.k, q.w])
+}
+
+/// Resample the recorded kinematics at presentation time. Recorded poses remain
+/// unchanged; FK after quaternion interpolation preserves every shared length.
+fn sample_pose(
+    record: &Recording,
+    subject: &Subject,
+    seconds: f64,
+    fps: f64,
+    override_fps: bool,
+) -> Result<Frame> {
+    let frames = &subject.frames;
+    let next = frames.partition_point(|f| record.time(f.frame, fps, override_fps) <= seconds);
+    if next == 0 {
+        return Ok(frames[0].clone());
+    }
+    if next >= frames.len() {
+        return Ok(frames[frames.len() - 1].clone());
+    }
+    let (a, b) = (&frames[next - 1], &frames[next]);
+    let t0 = record.time(a.frame, fps, override_fps);
+    let t1 = record.time(b.frame, fps, override_fps);
+    let t = ((seconds - t0) / (t1 - t0).max(1e-9)).clamp(0.0, 1.0);
+    if t < 1e-9 {
+        return Ok(a.clone());
+    }
+    if t > 1.0 - 1e-9 {
+        return Ok(b.clone());
+    }
+    let mut result = a.clone();
+    for axis in 0..3 {
+        result.root_position[axis] = a.root_position[axis] * (1.0 - t) + b.root_position[axis] * t;
+    }
+    result.root_orientation_xyzw =
+        blend_rotation(a.root_orientation_xyzw, b.root_orientation_xyzw, t)?;
+    for i in 0..result.joint_rotations.len() {
+        result.joint_rotations[i].quaternion_xyzw = blend_rotation(
+            a.joint_rotations[i].quaternion_xyzw,
+            b.joint_rotations[i].quaternion_xyzw,
+            t,
+        )?;
+        result.joint_rotations[i].confidence = a.joint_rotations[i]
+            .confidence
+            .zip(b.joint_rotations[i].confidence)
+            .map(|(a, b)| a.min(b));
+    }
+    result.prediction.body = a.prediction.body || b.prediction.body;
+    result.prediction.hands = a.prediction.hands || b.prediction.hands;
+    result.prediction.head = a.prediction.head || b.prediction.head;
+    result.root_depth_observed = a
+        .root_depth_observed
+        .zip(b.root_depth_observed)
+        .map(|(a, b)| a && b);
+    for hand in &mut result.hands {
+        if let Some(other) = b.hands.iter().find(|h| h.side == hand.side) {
+            for i in 0..hand.bone_rotations_xyzw.len() {
+                hand.bone_rotations_xyzw[i] = blend_body_relative(
+                    hand.bone_rotations_xyzw[i],
+                    other.bone_rotations_xyzw[i],
+                    a.root_orientation_xyzw,
+                    b.root_orientation_xyzw,
+                    result.root_orientation_xyzw,
+                    t,
+                )?;
+            }
+            hand.confidence = hand.confidence.min(other.confidence);
+        }
+    }
+    if let (Some(head), Some(other)) = (&mut result.head, &b.head) {
+        head.orientation_xyzw = blend_body_relative(
+            head.orientation_xyzw,
+            other.orientation_xyzw,
+            a.root_orientation_xyzw,
+            b.root_orientation_xyzw,
+            result.root_orientation_xyzw,
+            t,
+        )?;
+        head.confidence = head.confidence.min(other.confidence);
+    }
+    Ok(result)
 }
 fn bracket<T>(items: &[(u64, T)], frame: u64) -> (usize, usize) {
     let i = items.partition_point(|p| p.0 < frame);
@@ -782,7 +1080,7 @@ fn complete_motion(
             result.prediction.body = true;
             result.root_orientation_xyzw =
                 blend_rotation(a.root_orientation_xyzw, b.root_orientation_xyzw, t)?;
-            for i in 0..N {
+            for i in 0..result.joint_rotations.len() {
                 result.joint_rotations[i].quaternion_xyzw = blend_rotation(
                     a.joint_rotations[i].quaternion_xyzw,
                     b.joint_rotations[i].quaternion_xyzw,
@@ -974,7 +1272,7 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
     ensure!(end > first, "Replay timeline is empty");
     continuous
         .frames
-        .retain(|f| f.frame >= first && f.frame < end);
+        .retain(|f| f.frame >= first.saturating_sub(1) && f.frame <= end);
     eprintln!(
         "Replay continuity: {} frames, {} interpolated/held body poses",
         continuous.frames.len(),
@@ -1035,15 +1333,27 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
             while cursor + 1 < end && time(cursor + 1) - origin <= seconds + 1e-9 {
                 cursor += 1;
             }
+            let sampled = sample_pose(
+                &record,
+                &continuous,
+                seconds + origin,
+                fps,
+                options.fps.is_some(),
+            )?;
             writer.write(&render(
                 &record,
                 &subjects,
                 cursor,
-                &follow_bounds,
+                if default_view.follow {
+                    &follow_bounds
+                } else {
+                    &world_bounds
+                },
                 &default_view,
                 seconds,
                 1.0,
                 false,
+                Some(&sampled),
             )?)?;
         }
         writer.release()?;
@@ -1063,6 +1373,23 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
         } else {
             &world_bounds
         };
+        let presentation_time = time(cursor)
+            + if paused {
+                0.0
+            } else {
+                (Instant::now() - deadline).as_secs_f64() * speed
+            };
+        let sampled = if paused {
+            None
+        } else {
+            Some(sample_pose(
+                &record,
+                &continuous,
+                presentation_time.min(time(end - 1)),
+                fps,
+                options.fps.is_some(),
+            )?)
+        };
         highgui::imshow(
             "3D human twin replay",
             &render(
@@ -1071,9 +1398,10 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
                 cursor,
                 scene,
                 &view,
-                time(cursor) - origin,
+                presentation_time - origin,
                 speed,
                 paused,
+                sampled.as_ref(),
             )?,
         )?;
         let key = highgui::wait_key_ex(10)?;
@@ -1103,6 +1431,7 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
             45 => view.zoom = (view.zoom / 1.1).max(0.3),
             102 => view.follow = !view.follow,
             110 => view.names = !view.names,
+            98 => view.surface = view.surface.next(),
             49 => {
                 view.yaw = 0.0;
                 view.pitch = 0.0;
@@ -1158,6 +1487,73 @@ pub fn run(path: &Path, options: Options<'_>) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn schema_two_head_pivot_replays_and_interpolates_independently() -> Result<()> {
+        let mut names: Vec<_> = crate::motion3d::NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        names.insert(9, "head_pivot".into());
+        let parents = vec![
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(0),
+            Some(4),
+            Some(5),
+            Some(0),
+            Some(7),
+            Some(8),
+            Some(9),
+            Some(10),
+            Some(8),
+            Some(12),
+            Some(13),
+            Some(8),
+            Some(15),
+            Some(16),
+        ];
+        let mut offsets = vec![[0.0; 3]; 18];
+        offsets[10] = [0.0, -0.2, 0.0];
+        offsets[11] = [0.0, -0.1, 0.0];
+        offsets[12] = [0.2, 0.0, 0.0];
+        offsets[15] = [-0.2, 0.0, 0.0];
+        let mut quats:Vec<_>=names.iter().map(|n|serde_json::json!({"joint":n,"quaternion_xyzw":[0.0,0.0,0.0,1.0],"confidence":1.0})).collect();
+        let first = serde_json::json!({"frame":0,"root_position":[0.0,0.0,2.0],"root_orientation_xyzw":[0.0,0.0,0.0,1.0],"joint_rotations":quats});
+        quats[9]["quaternion_xyzw"] = serde_json::json!([0.0, 0.0, 0.5_f64.sqrt(), 0.5_f64.sqrt()]);
+        quats[17]["quaternion_xyzw"] =
+            serde_json::json!([0.5_f64.sqrt(), 0.0, 0.0, 0.5_f64.sqrt()]);
+        let second = serde_json::json!({"frame":2,"root_position":[0.0,0.0,2.0],"root_orientation_xyzw":[0.0,0.0,0.0,1.0],"joint_rotations":quats});
+        let value = serde_json::json!({"schema_version":2,"quaternion_convention":"xyzw_active_parent_local","joint_names":names,"parents":parents,
+            "subjects":[{"subject_segment":0,"person":{"rest_offsets":offsets},"frames":[first,second]}]});
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), serde_json::to_vec(&value)?)?;
+        let record = Recording::load(file.path())?;
+        let s = &record.subjects[0];
+        let a = record.positions(s, &s.frames[0], false)?;
+        let b = record.positions(s, &s.frames[1], false)?;
+        assert_eq!(a[11], b[11]);
+        assert_eq!(a[14], b[14]);
+        assert!((b[9] - a[9]).norm() > 0.2);
+        let middle = sample_pose(&record, s, 1.0 / 30.0, 30.0, true)?;
+        assert!(
+            (rotation(middle.joint_rotations[9].quaternion_xyzw)?.angle()
+                - std::f64::consts::FRAC_PI_4)
+                .abs()
+                < 1e-10
+        );
+        assert!(
+            (rotation(middle.joint_rotations[17].quaternion_xyzw)?.angle()
+                - std::f64::consts::FRAC_PI_4)
+                .abs()
+                < 1e-10
+        );
+        let positions = record.positions(s, &middle, false)?;
+        assert!(((positions[9] - positions[8]).norm() - 0.2).abs() < 1e-12);
+        assert!(((positions[10] - positions[9]).norm() - 0.1).abs() < 1e-12);
+        Ok(())
+    }
+    #[test]
     fn missing_details_turn_with_the_body_through_a_full_spin() {
         let identity = [0.0, 0.0, 0.0, 1.0];
         let half = Q::from_axis_angle(&V::y_axis(), std::f64::consts::PI);
@@ -1195,6 +1591,8 @@ mod tests {
         let subject = Subject {
             subject_segment: 0,
             person: Person {
+                ear_head: false,
+                head_radius: None,
                 rest_offsets: offsets,
                 hands: BTreeMap::new(),
             },
@@ -1204,6 +1602,7 @@ mod tests {
             prediction: Prediction::default(),
             frame: 0,
             root_position: [2.0, 3.0, 4.0],
+            root_depth_observed: None,
             root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             joint_rotations: (0..17)
                 .map(|i| JointRotation {
@@ -1282,6 +1681,7 @@ mod tests {
             prediction: Prediction::default(),
             frame,
             root_position: [0.0; 3],
+            root_depth_observed: None,
             root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             joint_rotations: (0..17)
                 .map(|i| JointRotation {
@@ -1296,6 +1696,8 @@ mod tests {
         let subject = |id, a, b| Subject {
             subject_segment: id,
             person: Person {
+                ear_head: false,
+                head_radius: None,
                 rest_offsets: vec![[0.0, 1.0, 0.0]; 17],
                 hands: BTreeMap::new(),
             },
@@ -1341,6 +1743,8 @@ mod tests {
         let subject = Subject {
             subject_segment: 0,
             person: Person {
+                ear_head: false,
+                head_radius: None,
                 rest_offsets: Vec::new(),
                 hands: shapes,
             },
@@ -1352,6 +1756,7 @@ mod tests {
             prediction: Prediction::default(),
             frame: 0,
             root_position: [0.0; 3],
+            root_depth_observed: None,
             root_orientation_xyzw: [0.0, 0.0, 0.0, 1.0],
             joint_rotations: Vec::new(),
             head: None,
@@ -1374,6 +1779,7 @@ mod tests {
             prediction: Prediction::default(),
             frame,
             root_position: [frame as f64 / 10.0, 0.0, 0.0],
+            root_depth_observed: None,
             root_orientation_xyzw: q_array(Q::from_euler_angles(0.0, angle, 0.0)),
             joint_rotations: (0..17)
                 .map(|i| JointRotation {
@@ -1388,6 +1794,8 @@ mod tests {
         let subject = |id, length, frames| Subject {
             subject_segment: id,
             person: Person {
+                ear_head: false,
+                head_radius: None,
                 rest_offsets: vec![[0.0, length, 0.0]; 17],
                 hands: BTreeMap::new(),
             },
@@ -1545,6 +1953,75 @@ mod tests {
                 ((visible[i] - visible[8]).norm() - (original[i] - original[8]).norm()).abs()
                     < 1e-12
             );
+        }
+    }
+    #[test]
+    fn presentation_time_interpolates_kinematics_without_changing_observed_samples() {
+        let mut record = continuity_fixture();
+        record.parents = (0..N).map(|i| i.checked_sub(1)).collect();
+        let timing = record.recording.as_mut().unwrap();
+        timing.frame_count = 2;
+        timing.timestamps_seconds = vec![0.0, 0.2];
+        let mut subject = record.subjects[0].clone();
+        subject.frames[1].frame = 1;
+        subject.frames[1].root_position = [1.0, 0.0, 0.0];
+        subject.frames[1].root_orientation_xyzw = q_array(Q::from_axis_angle(
+            &V::y_axis(),
+            std::f64::consts::FRAC_PI_2,
+        ));
+        subject.frames[1].joint_rotations[1].quaternion_xyzw =
+            q_array(Q::from_axis_angle(&V::z_axis(), 1.0));
+        let middle = sample_pose(&record, &subject, 0.1, 30.0, false).unwrap();
+        assert!((middle.root_position[0] - 0.5).abs() < 1e-12);
+        assert!(
+            (rotation(middle.root_orientation_xyzw).unwrap().angle() - std::f64::consts::FRAC_PI_4)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (rotation(middle.joint_rotations[1].quaternion_xyzw)
+                .unwrap()
+                .angle()
+                - 0.5)
+                .abs()
+                < 1e-12
+        );
+        let positions = record.positions(&subject, &middle, false).unwrap();
+        for i in 1..N {
+            assert!(((positions[i] - positions[i - 1]).norm() - 1.0).abs() < 1e-12);
+        }
+        for (time, index) in [(0.0, 0), (0.2, 1)] {
+            let observed = sample_pose(&record, &subject, time, 30.0, false).unwrap();
+            assert_eq!(observed.root_position, subject.frames[index].root_position);
+            assert_eq!(
+                observed.root_orientation_xyzw,
+                subject.frames[index].root_orientation_xyzw
+            );
+        }
+    }
+    #[test]
+    fn default_view_keeps_body_translation_and_relative_joint_geometry() {
+        let record = continuity_fixture();
+        let subject = &record.subjects[0];
+        let frame = &subject.frames[0];
+        let view = View::default();
+        assert!(!view.follow);
+        assert_eq!(view.yaw, 0.0);
+        assert_eq!(view.pitch, 0.0);
+        let original = display_positions(&record, subject, frame, view.follow, true).unwrap();
+        let mut moved = frame.clone();
+        let shift = V::new(0.4, -0.1, -0.3);
+        moved.root_position = (vector(frame.root_position) + shift).into();
+        let translated = display_positions(&record, subject, &moved, view.follow, true).unwrap();
+        for i in 0..N {
+            assert!((translated[i] - original[i] - shift).norm() < 1e-12);
+            if let Some(parent) = record.parents[i] {
+                assert!(
+                    ((translated[i] - translated[parent]) - (original[i] - original[parent]))
+                        .norm()
+                        < 1e-12
+                );
+            }
         }
     }
 }

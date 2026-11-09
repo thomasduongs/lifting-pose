@@ -12,11 +12,31 @@ pub struct Palm {
     bbox: [f32; 4],
     pub score: f32,
 }
+#[cfg(test)]
+impl Palm {
+    pub fn from_test_landmarks(landmarks: [[f32; 2]; 7]) -> Self {
+        Self {
+            landmarks,
+            bbox: [0.0; 4],
+            score: 1.0,
+        }
+    }
+}
 pub struct PalmDetector {
     net: dnn::Net,
+    accelerated: crate::accelerated::Inference,
+    model_path: std::path::PathBuf,
     names: Vector<String>,
 }
 impl PalmDetector {
+    pub fn enable_acceleration(&mut self) {
+        if let Err(error) = self.accelerated.enable_crop(&self.model_path) {
+            eprintln!(
+                "Native inference unavailable for {}: {error:#}; using OpenCV",
+                self.model_path.display()
+            );
+        }
+    }
     pub fn new(path: &Path) -> Result<Self> {
         ensure!(
             path.is_file(),
@@ -30,14 +50,28 @@ impl PalmDetector {
         net.set_preferable_backend(dnn::DNN_BACKEND_OPENCV)?;
         opencv::not_opencv_branch_5! {net.set_preferable_target(dnn::DNN_TARGET_CPU)?;}
         let names = net.get_unconnected_out_layers_names()?;
-        Ok(Self { net, names })
+        Ok(Self {
+            net,
+            names,
+            accelerated: crate::accelerated::Inference::default(),
+            model_path: std::path::PathBuf::from(path),
+        })
     }
     pub fn infer(&mut self, image: &Mat) -> Result<Vec<Palm>> {
         let size = image.size()?;
-        let scale = 192.0 / f64::from(size.width.max(size.height));
+        self.infer_region(image, [0.0, 0.0, size.width as f32, size.height as f32])
+    }
+    /// Detect inside an image-space region; decoded landmarks stay in the
+    /// original frame's coordinates, including when the region crosses an edge.
+    pub fn infer_region(&mut self, image: &Mat, region: [f32; 4]) -> Result<Vec<Palm>> {
+        ensure!(
+            region.iter().all(|v| v.is_finite()) && region[2] > 0.0 && region[3] > 0.0,
+            "Invalid palm detection region"
+        );
+        let scale = 192.0 / f64::from(region[2].max(region[3]));
         let pad = [
-            (192.0 - f64::from(size.width) * scale) / 2.0,
-            (192.0 - f64::from(size.height) * scale) / 2.0,
+            (192.0 - f64::from(region[2]) * scale) / 2.0 - f64::from(region[0]) * scale,
+            (192.0 - f64::from(region[3]) * scale) / 2.0 - f64::from(region[1]) * scale,
         ];
         let affine = Mat::from_slice_2d(&[[scale, 0.0, pad[0]], [0.0, scale, pad[1]]])?;
         let mut crop = Mat::default();
@@ -46,10 +80,10 @@ impl PalmDetector {
         imgproc::cvt_color_def(&crop, &mut rgb, imgproc::COLOR_BGR2RGB)?;
         let mut float = Mat::default();
         rgb.convert_to(&mut float, core::CV_32F, 1.0 / 255.0, 0.0)?;
-        self.net
-            .set_input_def(&float.reshape_nd(1, &[1, 192, 192, 3])?)?;
-        let mut outputs = Vector::<Mat>::new();
-        self.net.forward(&mut outputs, &self.names)?;
+        let blob = float.reshape_nd(1, &[1, 192, 192, 3])?;
+        let outputs = self
+            .accelerated
+            .forward(&mut self.net, &blob, &self.names)?;
         let mut boxes = None;
         let mut scores = None;
         for output in outputs {

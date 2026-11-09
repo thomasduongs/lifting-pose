@@ -21,10 +21,20 @@ pub struct Detection {
 
 pub struct PersonDetector {
     net: dnn::Net,
+    accelerated: crate::accelerated::Inference,
+    model_path: std::path::PathBuf,
     output_names: Vector<String>,
 }
 
 impl PersonDetector {
+    pub fn enable_acceleration(&mut self) {
+        if let Err(error) = self.accelerated.enable(&self.model_path) {
+            eprintln!(
+                "Native inference unavailable for {}: {error:#}; using OpenCV",
+                self.model_path.display()
+            );
+        }
+    }
     pub fn new(path: &Path) -> Result<Self> {
         ensure!(
             path.is_file(),
@@ -39,7 +49,12 @@ impl PersonDetector {
         opencv::not_opencv_branch_5! { net.set_preferable_target(dnn::DNN_TARGET_CPU)?; }
         let output_names = net.get_unconnected_out_layers_names()?;
         ensure!(output_names.len() == 1, "Expected one raw YOLOX-s output");
-        Ok(Self { net, output_names })
+        Ok(Self {
+            net,
+            output_names,
+            accelerated: crate::accelerated::Inference::default(),
+            model_path: path.to_path_buf(),
+        })
     }
 
     pub fn detect(
@@ -74,9 +89,9 @@ impl PersonDetector {
             false,
             core::CV_32F,
         )?;
-        self.net.set_input_def(&blob)?;
-        let mut outputs = Vector::<Mat>::new();
-        self.net.forward(&mut outputs, &self.output_names)?;
+        let outputs = self
+            .accelerated
+            .forward(&mut self.net, &blob, &self.output_names)?;
         ensure!(
             outputs.len() == 1,
             "YOLOX-s returned an unexpected output count"
