@@ -921,6 +921,24 @@ cargo run -- --help
 cargo test
 ```
 
+## Offline inverse FEM twin (experimental)
+
+`scripts/reconstruct_twin.py` fits a coarse tetrahedral elastic scaffold to the
+saved skeletal motion in `output/recording.twin`, writing to `output/fem-twin`.
+It fits displacements to inherited skeletal estimates. It does not estimate
+anatomy, tissue stiffness, or forces, and it does not reproduce a specific
+published method.
+
+```sh
+python3 -m pip install -r scripts/requirements-fem.txt
+python3 scripts/reconstruct_twin.py output/recording.twin
+python3 scripts/render_fem_twin.py output/fem-twin --output output/fem-twin/front.mp4
+```
+
+The renderer (`scripts/render_fem_twin.py`, needs `opencv-python`) writes a
+headless MP4 of the scaffold. Details, options, outputs, and limitations:
+[docs/inverse-fem.md](docs/inverse-fem.md).
+
 ## Implementation and sources
 
 - `src/pose.rs`: padded aspect-preserving affine crop, RGB mean/std normalization,
