@@ -8,6 +8,9 @@ separate ONNX Runtime installation is required.
 A skeletal twin fits the 3D observations using shared body dimensions and
 per-frame rotations, preserving bone lengths through forward kinematics.
 
+Open the anatomical model in the native Rust viewer with `./scripts/view_biomech.sh`.
+See [viewer controls and simulation mode](docs/rust-viewer.md).
+
 
 ## MediaPipe Pose (default)
 
@@ -1027,3 +1030,27 @@ These commands write headless numerical output. `replay` follows the fitted reco
 contact and whole-body balance. Source anatomy and tissue parameters remain generic.
 See [commands and scope](docs/rust-biomechanics.md) and
 [numerical validation and performance](docs/rust-biomech-results.md).
+
+## Native Rust 3D anatomy viewer
+
+```sh
+./scripts/view_biomech.sh
+./scripts/view_biomech.sh --simulation
+```
+
+The default opens your fitted recording with source bone meshes and muscle-tendon and
+ligament paths, driven by `biomech-lite`. Space plays/pauses, dragging orbits, the wheel
+zooms, and the bottom timeline scrubs. Tab switches to the background Rust arm simulator;
+select a muscle, adjust excitation and press Space to run it. Simulation starts paused.
+
+Use the sidebar to change camera views and anatomical layers. Recording playback loops
+by default and preserves the irregular source clock. The camera frames the full motion
+range, including raised hands. This is generic anatomy; muscle paths represent MTUs,
+and dynamic simulation holds the torso and non-arm independent coordinates fixed.
+
+Create a Finder application with `./scripts/package_biomech_viewer.sh`, then open
+`output/Biomech Viewer.app`. It packages the executable, model, motion, meshes and notices.
+The viewer needs no Python, MuJoCo, OpenCV, ONNX or browser at runtime.
+
+See [all commands and controls](docs/rust-viewer.md) and
+[rendering and verification results](docs/rust-viewer-results.md).
