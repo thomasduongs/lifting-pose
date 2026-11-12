@@ -5,6 +5,34 @@ recording. It reconstructs a displacement field using the existing skeletal
 estimates plus limited visible-width evidence. Anatomical accuracy has **not**
 been established by this recording.
 
+## Complete-recording results
+
+| Quantity | Result |
+| --- | --- |
+| Source frames reconstructed | 222 / 222, no skips |
+| Recorded time span | 8.0593 seconds, original irregular timestamps preserved |
+| Mesh | 1,286 vertices; 4,698 tetrahedra |
+| Invalid frames / inverted elements | 0 / 0 |
+| Converged frames | 218 / 222 |
+| Frames reaching 120-iteration limit | 0, 192, 194, 197 |
+| Mean weighted target RMSE | 0.002369 inferred meters (2.37 mm in the inferred scale) |
+| Maximum frame target RMSE | 0.005053 inferred meters |
+| Minimum element determinant across frames | 0.050142 |
+| Source image-joint reprojection RMSE, mean | 11.566 pixels, inherited and unchanged |
+| Complete reconstruction wall time | 1,753 seconds on this machine |
+
+All exported vertex coordinates and reported objective/residual/determinant
+values were finite. Every source frame index 0–221 is present, and timestamps
+remain strictly increasing. Nonconverged frames remained valid and are explicitly
+reported; they are not counted as converged successes.
+
+Artifacts: [front animation](../output/fem-twin/front.mp4),
+[side animation](../output/fem-twin/side.mp4),
+[first-frame preview](../output/fem-twin/preview.png),
+[manifest](../output/fem-twin/manifest.json), and
+[per-frame diagnostics](../output/fem-twin/subject_00_segment_0/diagnostics.json).
+The subject directory also contains compressed mesh/motion arrays and OBJ surfaces.
+
 ## Reproduce
 
 From the repository root:
@@ -35,6 +63,10 @@ arm cross-sections. Rejected observations and unsupported radii remain explicit
 in `manifest.json`. Visible widths constrain the clothed silhouette, not tissue.
 One forearm has sufficient support in this recording. All other radius estimates
 remain declared priors. No new model downloads or training are required.
+Specifically, 15 of 24 sampled frames passed presence screening, yielding 40
+accepted cross-sections overall. The left forearm used six supporting frames and
+changed from a prior radius of 0.03204 to 0.03402 inferred meters. Other arm bones
+did not reach the required support and retain explicit fallback reasons.
 
 ## Numerical method
 
@@ -50,6 +82,10 @@ The solve can deviate from skinning targets to keep tetrahedra valid. Element
 validity does not prevent global surface intersections, and a determinant floor
 of 0.05 still permits substantial local compression. This is not a tissue
 equilibrium, contact, muscle, force, stress, or injury model.
+The voxel mesh conservatively includes intersecting cells, so its blocky boundary
+can extend beyond the underlying capsule radius by a cell-scale amount. At 0.04
+spacing this is significant for narrow limbs. The calibrated radius parameter is
+not a claim that the final mesh's visible surface matches the video silhouette.
 
 ## Verification
 
@@ -72,7 +108,11 @@ identify a specific Baek lab reverse-FEM paper and do not claim to reproduce one
 Codex led research, API contracts, numerical-design guidance, and integration.
 Claude Opus implemented and repaired the FEM solver; Claude Sonnet built the
 recording pipeline and video calibration; Claude Haiku wrote documentation and
-the headless renderer. Claude owns eight of the ten completed/planned work items.
+the headless renderer. Claude owns eight of the ten work items.
+
+The workers' final CLI token-cost estimates total approximately **$4.93**
+(Opus $3.18, Sonnet $1.68, Haiku $0.07). This excludes the Codex lead session;
+it is usage accounting from the worker CLI, not a subscription billing receipt.
 
 ## Accuracy boundary
 

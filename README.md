@@ -930,10 +930,14 @@ anatomy, tissue stiffness, or forces, and it does not reproduce a specific
 published method.
 
 ```sh
-python3 -m pip install -r scripts/requirements-fem.txt
+python3 -m pip install -r scripts/requirements-fem-video.txt
 python3 scripts/reconstruct_twin.py output/recording.twin
 python3 scripts/render_fem_twin.py output/fem-twin --output output/fem-twin/front.mp4
 ```
+
+`--fit-silhouette` optionally calibrates supported visible-arm widths from the
+saved video. [Complete-recording results](docs/inverse-fem-results.md) report
+accuracy limits, convergence, artifacts, and the research basis.
 
 The renderer (`scripts/render_fem_twin.py`, needs `opencv-python`) writes a
 headless MP4 of the scaffold. Details, options, outputs, and limitations:
@@ -985,3 +989,18 @@ interface follows the [official OpenCV Zoo example](https://github.com/opencv/op
 extracts only temporary twin data during replay.
 
 `src/scope.rs` defines active upper-body landmarks and suppresses lower-body observations.
+
+## Biomechanical simulation (experimental)
+
+A sourced full-body reference model (MyoSim 0.2.5 on MuJoCo 3.17.0) with a
+recording fit and a headless renderer. It is reference anatomy, not
+subject-specific anatomy. Setup, commands, outputs, and limitations are in
+[docs/biomechanics.md](docs/biomechanics.md). Render a fitted subject:
+
+```sh
+.venv-biomech/bin/mjpython scripts/replay_biomech.py output/biomech-twin --loop
+```
+
+This is the new anatomical model; Rust `--replay` still plays the original
+skeletal twin. [Research and run results](docs/biomechanics-results.md) include
+force-production curves, ligament coverage, fit residuals and accuracy limits.

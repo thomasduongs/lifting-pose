@@ -1,0 +1,17 @@
+# Biomechanics stack (scripts/biomech_*.py). Verified with Python 3.13.2 on macOS (darwin arm64)
+# in .venv-biomech:  python3 -m venv .venv-biomech && .venv-biomech/bin/python -m pip install -r scripts/requirements-biomech.txt
+# model.mjb is MuJoCo-version specific; keep mujoco pinned or rebuild from model.xml / the recipe
+# in output/biomech-reference/provenance.json.
+myo-sim==0.2.5
+mujoco==3.17.0
+numpy==2.5.4
+scipy==1.18.1
+opencv-python==5.0.0.93
+# transitive (pinned for reproducibility)
+absl-py==2.5.1
+etils==1.15.0
+fsspec==2026.9.0
+glfw==2.11.0
+PyOpenGL==3.1.10
+typing_extensions==4.16.0
+zipp==4.1.2
