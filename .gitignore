@@ -1,4 +1,5 @@
 /target/
+/crates/biomech-lite/target/
 /models/*
 !/models/.gitkeep
 /output/

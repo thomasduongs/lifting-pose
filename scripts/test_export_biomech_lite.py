@@ -54,7 +54,15 @@ class ExportTest(unittest.TestCase):
             self.assertLess(np.abs(M - M.T).max(), 1e-9)
             self.assertGreater(np.linalg.eigvalsh(M).min(), 0)
             self.assertTrue(min(c["muscle_tensions"]) >= -1e-9)
+        for c in cases:
+            for k in ("reduced_velocity", "reduced_bias", "reduced_muscle_torque", "reduced_passive_torque"):
+                self.assertEqual(len(c[k]), 8, k)
+        st = cases[0]
+        np.testing.assert_allclose(st["reduced_bias"], st["reduced_gravity"], atol=1e-9)
+        self.assertTrue(any(c["name"].startswith("ligament_loaded") and np.abs(c["reduced_passive_torque"]).max() > 1
+                            for c in cases))
         v = [c for c in cases if c["name"].startswith("velocity_")]
+        self.assertTrue(all(np.abs(np.array(c["reduced_bias"]) - c["reduced_gravity"]).max() > 1e-6 for c in v))
         self.assertTrue(all(np.abs(c["tendon_velocities"]).max() > 0 for c in v))
         self.assertTrue(any(np.abs(c["activation_derivative"]).max() > 0 for c in cases))
 

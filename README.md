@@ -1004,3 +1004,26 @@ subject-specific anatomy. Setup, commands, outputs, and limitations are in
 This is the new anatomical model; Rust `--replay` still plays the original
 skeletal twin. [Research and run results](docs/biomechanics-results.md) include
 force-production curves, ligament coverage, fit residuals and accuracy limits.
+
+## Standalone Rust biomechanics runtime
+
+`crates/biomech-lite` implements the model's forward kinematics, native tendon wrapping,
+muscle activation and force laws, ligament springs, and eight-coordinate fixed-torso arm
+dynamics in Rust. Runtime uses the exported JSON anatomy and motion; Python and MuJoCo
+are only used for offline fitting, export and reference validation. The current recording's
+assets are included under `assets/biomech-lite`.
+
+From the project root:
+
+```sh
+cargo build --release --manifest-path crates/biomech-lite/Cargo.toml
+crates/biomech-lite/target/release/biomech-lite inspect
+crates/biomech-lite/target/release/biomech-lite replay --output output/biomech-lite/replay.json
+crates/biomech-lite/target/release/biomech-lite simulate --output output/biomech-lite/simulation.json --duration 0.5 --dt 0.001 --muscle BIClong --excitation 0.25
+```
+
+These commands write headless numerical output. `replay` follows the fitted recording;
+`simulate` computes arm motion under a chosen excitation. Forward dynamics exclude
+contact and whole-body balance. Source anatomy and tissue parameters remain generic.
+See [commands and scope](docs/rust-biomechanics.md) and
+[numerical validation and performance](docs/rust-biomech-results.md).

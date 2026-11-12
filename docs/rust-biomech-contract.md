@@ -145,3 +145,78 @@ Exact parity is limited to implemented subset; report observed max error and uns
 features. Replay all222fittedframes in Rust; run short finite dynamic excitation.
 Deliver release binary size and timing, Rust-only runtime command, source attribution,
 and clear distinction between prescribed recording and forward dynamic simulation.
+
+## Settled dynamics algorithm and API
+
+Implementation decisions are fixed here so D1 needs no further physics design.
+Use nalgebra dynamic matrices internally. Expose:
+
+```
+pub struct State { pub qpos:Vec<f64>, pub velocity:Vec<f64>, pub activation:Vec<f64> }
+pub fn mass_matrix(model:&Model,q:&[f64])->Result<nalgebra::DMatrix<f64>,String>;
+pub fn gravity(model:&Model,q:&[f64])->Result<Vec<f64>,String>;
+pub fn bias(model:&Model,q:&[f64],v:&[f64])->Result<Vec<f64>,String>;
+pub fn muscle_torque(model:&Model,q:&[f64],v:&[f64],a:&[f64])->Result<Vec<f64>,String>;
+pub fn step(model:&Model,state:&mut State,excitation:&[f64],dt:f64)->Result<(),String>;
+```
+
+For each of eight x coordinates, perturb its scalar qpos by +/-h (h=1e-6), project
+all couplings and call kinematics. For each body compute world COM as
+`body_pos + rotate(body_quat, body.ipos)`; its Jv column is centered COM difference.
+Jw column is the scaled-axis/log vector of `Rplus * Rminus.transpose()` divided
+by 2h (WORLD angular velocity). Use normalized UnitQuaternion and scaled_axis.
+Compute C's scalar rows from centered qpos differences using joint qposadr/dofadr;
+the held free-root rows are zero. All scalar joint rows, including dependencies,
+contribute native armature, spring and damping; do not only sum eight masters.
+
+At central q, Iworld = Rbody*Riquat*diag(inertia)*(Rbody*Riquat).transpose().
+`M = sum_b(mass_b*Jv_b.T*Jv_b + Jw_b.T*Iworld_b*Jw_b) + C.T*diag(armature)*C`.
+`gravity = -sum_b(Jv_b.T * mass_b * model.gravity)` (required holding torque).
+Skip world body; massless bodies contribute no rigid inertia, but their descendant
+Jacobians still matter. This matches `C.T * native_M * C`.
+
+For nonzero v, get dM/dx[k] by centered mass_matrix differences with OUTER step
+1e-4 to avoid cancellation from the inner 1e-6 Jacobians. Coriolis component i is
+`sum_jk (dM/dx[k][i,j] - 0.5*dM/dx[i][j,k])*v[j]*v[k]`.
+`bias = gravity + Coriolis`; v=0 bypasses mass derivative calls.
+
+Tendon Jacobian Jt (ntendon x8) is centered length differences at the same projected
+q+/-h. Length velocity = Jt*v. Muscle tensions come from Model::muscle_forces;
+sum torques `-Jt[tendon,:]*tension`. Spring tension is
+`stiffness*(length-clamp(length,low,high)) + damping*length_velocity`, and its torque
+also uses `-Jt.T`. Scalar passive spring/damping is projected `C.T*(-k*(q-qref)-d*C*v)`.
+
+Step: validate dimensions, all finite, dt>0 and dt<=0.002; activation is forward
+Euler with native activation_dot and clamp [0,1]. Forces use the pre-step activation,
+matching the source model's actearly=false; activation is advanced for the next step.
+Compute qdd by Cholesky solve
+of `M*qdd = muscle_torque + passive_torque - bias`. Semi-implicit velocity then
+selected scalar coordinate update, then project. Reject nonfinite state. If a master
+hits a native bound, clamp it and set its velocity0. If a dependent bound is crossed,
+backtrack the proposed displacement until every scalar dependent bound is valid,
+setting affected velocities0. Return an error rather than emitting invalid bounds if
+this cannot be resolved. Stage updates in a clone so failed steps preserve input state.
+This is a documented hard-bound approximation to native soft constraints.
+
+## P1 analytic body Jacobian optimization (supersedes finite body Jacobians)
+
+Use the existing `Kinematics.joint_anchor` and `joint_axis` world frames. Build C
+analytically: selected master rows are unit vectors, locked rows zero, then each
+dependent row = quartic slope at its master times that master's C row, in dependency
+order. For each body's COM, visit that body and every ancestor's scalar joints.
+A hinge contributes world linear Jacobian `axis.cross(COM-anchor)` and angular
+Jacobian `axis`; a slide contributes linear `axis`, angular zero. Multiply each
+contribution by that joint's C row and sum into the reduced body Jv/Jw. Free root
+is prescribed and contributes zero. Keep the same inertia/armature/gravity formula.
+This needs ONE FK per mass/gravity evaluation instead of seventeen. Keep centered
+mass derivatives for Coriolis and tendon-length derivatives initially. Public APIs
+and model JSON do not change. Native fixture parity must still pass. Tighten bias
+and torque assertions to 1e-4 Nm or better if measured results support it. Record
+before/after timing for the same 500-step command in docs; no speed claim without
+measurement. Address pending bounds comments while in dynamics, preserving atomic
+failed steps. This is a performance task owned by claude-mid.
+
+P1 also adds `reduced_passive_torque:[8] = C.T*qfrc_passive` to native reference
+cases and compares Rust `passive_torque` against it. This separately checks the
+four active ligament springs and scalar damping, including moving poses. Native
+actuator passive muscle bias belongs to `reduced_muscle_torque`, not this field.

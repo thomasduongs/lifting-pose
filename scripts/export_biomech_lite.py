@@ -61,6 +61,9 @@ def load_native(mjb=TWIN / "model.mjb"):
 
 
 def check_supported(m):
+    for pkg, ver in bm.PINNED.items():
+        if metadata.version(pkg) != ver:
+            raise ExportError("%s version %s != pinned %s" % (pkg, metadata.version(pkg), ver))
     bad = sorted(set(int(t) for t in m.jnt_type) - SUPPORTED_JOINTS)
     if bad:
         raise ExportError("unsupported joint kinds %s (ball not implemented)" % bad)
@@ -191,12 +194,12 @@ def standing_qpos(m):
 
 
 def export_motion_json(m, recording_sha):
-    d = np.load(TWIN / "motion.npz", allow_pickle=True)
+    d = np.load(TWIN / "motion.npz", allow_pickle=False)
     q = np.array(d["qpos"], dtype=np.float64)
     if q.shape[1] != m.nq:
         raise ExportError("motion qpos width != nq")
     return {"schema_version": 1, "timestamps_seconds": f(d["timestamps_seconds"]),
-            "frame_indices": f(d["frame_indices"]), "qpos": q.tolist(),
+            "frame_indices": np.asarray(d["frame_indices"], dtype=np.int64).tolist(), "qpos": q.tolist(),
             "source": {"file": "output/biomech-twin/motion.npz", "frames": int(len(q)),
                        "recording_sha256": recording_sha, "note": "irregular timestamps kept as fitted"}}
 
@@ -254,6 +257,7 @@ def run_case(m, name, qpos, v8=None, act=None, ctrl=None):
         "control": f(d.ctrl), "reduced_mass": f(C.T @ M @ C), "reduced_gravity": f(C.T @ g.qfrc_bias),
         "reduced_velocity": f(v), "reduced_bias": f(reduced_bias),
         "reduced_muscle_torque": f(C.T @ d.qfrc_actuator),
+        "reduced_passive_torque": f(C.T @ d.qfrc_passive),
     }
 
 
@@ -284,6 +288,15 @@ def build_cases(m, motion_q):
         cases.append(run_case(m, "elv_angle_sweep_%d" % i, pose(frac([fr, 0.6, 0.5, 0.4, fr, 0.6, 0.5, 0.4]))))
     for i in range(4):
         cases.append(run_case(m, "asymmetric_%d" % i, pose(frac(0.1 + 0.8 * rng.random(8)))))
+    # ligament-loaded poses (found by scanning random poses for large native qfrc_passive)
+    loaded = ([0.432, 0.968, 0.655, 0.182, 0.96, 0.555, 0.113, 0.068],
+              [0.731, 0.666, 0.565, 0.594, 0.931, 0.449, 0.027, 0.244],
+              [0.975, 0.645, 0.144, 0.107, 0.429, 0.569, 0.447, 0.845],
+              [0.941, 0.602, 0.045, 0.409, 0.689, 0.469, 0.372, 0.251])
+    for i, fr in enumerate(loaded):
+        cases.append(run_case(m, "ligament_loaded_%d" % i, pose(frac(fr))))
+    cases.append(run_case(m, "ligament_loaded_velocity", pose(frac(loaded[0])),
+                          v8=[0.5, -0.4, 0.6, 0.3, -0.5, 0.4, 0.3, -0.6]))
     n = len(motion_q)
     for k in (0, n // 4, n // 2, 3 * n // 4, n - 30, n - 10, n - 1):
         cases.append(run_case(m, "recorded_frame_%d" % k, motion_q[k]))
