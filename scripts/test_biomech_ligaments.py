@@ -12,7 +12,7 @@ try:
     import biomech_model as bm
     import biomech_ligaments as lig
     import fit_biomech as fb
-    from test_reconstruct_twin import make_twin
+    from test_skeleton_recording import make_twin
     HAVE = True
 except ImportError:
     HAVE = False

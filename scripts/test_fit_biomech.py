@@ -17,7 +17,7 @@ try:
     HAVE = True
 except ImportError:  # run with the biomech venv
     HAVE = False
-from test_reconstruct_twin import make_twin
+from test_skeleton_recording import make_twin
 
 
 def zrot_quat(deg):
@@ -213,7 +213,7 @@ class FitBiomechTests(unittest.TestCase):
     def _bundle(self, twin, td, pts_override=None):
         """Write a .twin zip whose poses.jsonl holds ideal projections of the twin's own FK."""
         import zipfile
-        import reconstruct_twin as rt
+        import skeleton_recording as rt
         names, parents = rt.validate_hierarchy(twin)
         off = np.asarray(twin["subjects"][0]["person"]["rest_offsets"], float)
         lines = []

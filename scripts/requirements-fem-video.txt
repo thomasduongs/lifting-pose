@@ -1,2 +1,0 @@
--r requirements-fem.txt
-opencv-python>=4.8

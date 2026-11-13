@@ -27,8 +27,6 @@ Artifacts:
 * [Front animation](../output/biomech-twin/front.mp4)
 * [Side animation](../output/biomech-twin/side.mp4)
 * [Anatomy preview](../output/biomech-twin/preview.png)
-* [Force-production curves](../output/biomech-experiment/force-production.png)
-  ([vector SVG](../output/biomech-experiment/force-production.svg))
 * [Fitted model XML](../output/biomech-twin/model.xml),
   [native binary](../output/biomech-twin/model.mjb),
   [anatomy inventory](../output/biomech-twin/anatomy.json) and
@@ -94,32 +92,6 @@ error or motion. They are not verified true human joint velocities. Image
 observations themselves are network estimates; camera intrinsics may be assumed.
 Neither the residuals nor the smoothness of playback establish 3D ground truth.
 No hard angular-speed cap was used to disguise incompatible observations.
-
-## Force-production and mobility experiments
-
-Controlled isometric tests used prescribed activations and native joint-angle
-sweeps. They produce CSV/NPZ data, activation transients and moment-arm/torque
-curves:
-
-| Reference experiment | Result |
-| --- | --- |
-| Biceps long-head elbow moment arm, peak | 4.14 cm |
-| Biceps long-head full-activation torque, peak | +16.57 N m (flexion) |
-| Triceps long-head full-activation torque, peak magnitude | 16.15 N m (extension) |
-| Biceps moment-arm Jacobian vs length derivative | maximum discrepancy about 1.8e-10 m |
-| Active muscle torque vs engine generalized force | agreement to floating-point precision |
-| Activation step, 90% rise | approximately 28 ms under the source activation law |
-
-An additional [instantaneous force-velocity check](../output/biomech-experiment/force-velocity.json)
-held the biceps at 90-degree elbow flexion and full activation. At prescribed
-musculotendon velocities +0.194, 0 and -0.194 m/s, tensions were approximately
-521, 418 and 300 N respectively. This checks native lengthening/isometric/shortening
-behavior; it is not a measurement of the person's force or velocity.
-
-[Murray et al. (1995)](https://pubmed.ncbi.nlm.nih.gov/7775488/) provides independent
-experimental context for posture-dependent moment arms. Numerical derivative and
-sign checks verify implementation consistency, not quantitative agreement with
-every cadaver or subject in that study.
 
 ## Ligament mechanics and uncertainty
 

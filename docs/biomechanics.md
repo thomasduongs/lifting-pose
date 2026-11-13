@@ -122,12 +122,11 @@ Use `--max-frames` for a quick preview.
 
 ## Replay the fitted motion in the native viewer
 
-Four things share the word "replay" or "video". They are different:
+The retained replay and video commands have different outputs:
 
 | Command | What it shows | Simulation |
 | --- | --- | --- |
 | `cargo run --release -- --replay` (Rust, [README](../README.md)) | The original recording's twin, from the `.twin` file | Rust pose pipeline; not this model |
-| `scripts/render_fem_twin.py` | Inverse-FEM scaffold video | Experimental FEM, not this model |
 | `scripts/render_biomech.py` | Headless MP4/PNG of the sourced reference anatomy at the fitted pose | None (a picture of the kinematics) |
 | `scripts/replay_biomech.py` | Live native MuJoCo playback of the sourced reference model at the fitted pose | Kinematic: the joints follow the prescribed fit |
 
@@ -172,35 +171,14 @@ joint couplings, so dependent joints are never interpolated on their own.
   personal kinematics or clinical force predictions. The source head is rigid to
   the torso; detailed cervical articulation is absent.
 
-## Force-production and mobility experiments
+## Ligament sensitivity bench
 
 ```sh
-.venv-biomech/bin/python scripts/biomech_experiment.py \
-    --output output/biomech-experiment/BIClong_elbow_flexion_r \
-    --muscle BIClong --joint elbow_flexion_r
-.venv-biomech/bin/python scripts/biomech_experiment.py \
-    --output output/biomech-experiment/TRIlong_elbow_flexion_r \
-    --muscle TRIlong --joint elbow_flexion_r
 .venv-biomech/bin/python scripts/biomech_ligaments.py --output output/biomech-ligaments
 ```
 
-The isometric bench sweeps angle and prescribed activation, checks moment arms
-against tendon-length derivatives, and integrates the native activation response
-with kinematics clamped. It exports `sweep.csv`, `activation_step.csv`,
-`ligaments.csv`, `experiment.npz` and `diagnostics.json`. Tension is positive for
-pulling; moment arm is `-dL/dq`; torque is moment arm times tension. Partial
-native-coordinate and total coupled-coordinate moment arms are distinguished.
-This is controlled reference-model force production, not force identification
-from video or a force-driven reproduction of the recording.
-
-The ligament bench produces `ligament_sensitivity.csv/json`, varying source slack
-and published stiffness values on the four supported routes. It exposes parameter
-sensitivity; large simulated forces can lie outside the experimental load range
-and must not be interpreted as injury or personal tissue strength.
-
-[Research comparison](biomechanics-research.md) and
-[completed-run results](biomechanics-results.md) describe what was implemented,
-the artifacts and the remaining accuracy limits.
+This retained bench checks the reference ligament profiles used by model export.
+Live muscle estimation is documented in [muscle-estimates.md](muscle-estimates.md).
 
 ## Verification
 

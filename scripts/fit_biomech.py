@@ -11,7 +11,7 @@ equality polynomials (biomech_model.enforce_couplings) on EVERY residual evaluat
 Held at the standing keyframe (explicit priors): pro_sup, wrists, fingers, trunk,
 lower body, root.  Recorded per-finger quaternions are never copied.
 
-Alignment: recorded joint positions come from reconstruct_twin forward kinematics
+Alignment: recorded joint positions come from skeleton_recording forward kinematics
 (camera frame x right, y down, z forward).  Targets are expressed relative to the
 recorded shoulder in a per-frame torso frame (lateral = left-right shoulder,
 up = camera -y orthogonalised, forward = lateral x up; right-handed, no mirroring)
@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import reconstruct_twin as rt  # noqa: E402
+import skeleton_recording as rt  # noqa: E402
 import biomech_ligaments as lig  # noqa: E402
 
 warnings.filterwarnings("ignore")

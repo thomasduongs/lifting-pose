@@ -2,7 +2,7 @@
 
 The user prioritizes **biomechanical simulation**. Build a real research-model
 workflow, not another capsule scaffold. Preserve source recordings and existing
-Rust/FEM behavior. Do not open a browser, native viewer, or GUI for verification.
+Rust recording/replay behavior. Do not open a browser, native viewer, or GUI for verification.
 Use `.venv-biomech/bin/python` (Python 3.13) for all new work. Lead has installed
 myo-sim==0.2.5, mujoco==3.17.0, NumPy, SciPy and OpenCV in that isolated environment.
 
@@ -66,7 +66,7 @@ ligament injury, cartilage or subject-specific anatomical geometry. State this.
 
 * CLI `.twin|twin.json --output DIR [--stride N] [--max-frames N]
   [--ligament-stiffness N] [--ligament-slack-scale S] [--max-nfev N]`.
-* Reuse `reconstruct_twin.py` file/schema/timestamp/FK helpers where suitable.
+* Reuse `skeleton_recording.py` file/schema/timestamp/FK helpers where suitable.
   Fit positions to anatomical joint-center markers using confidence-weighted
   robust least_squares and actual anatomical joint limits. Optimize independent
   shoulder/elbow coordinates only (plus constrained root alignment if useful);
@@ -90,7 +90,7 @@ ligament injury, cartilage or subject-specific anatomical geometry. State this.
   with observed vs fixed DOFs, input sha, units, alignments, per-frame support,
   limits/coupling checks and optimizer status. Separate subject dirs if >1.
   Fit every frame by default, preserve irregular timestamps. Do not overwrite
-  source/FEM artifacts. Save model snapshot matching qpos interpretation.
+  source recordings. Save model snapshot matching qpos interpretation.
 * Add optional mechanics output `mechanics.npz` containing musculotendon lengths,
   velocities (actual nonuniform derivative or engine Jacobian*qvel), moment arms,
   passive generalized forces and inverse-dynamics generalized demand, with units.
@@ -117,22 +117,6 @@ ligament injury, cartilage or subject-specific anatomical geometry. State this.
   Update README with concise link and command. No claimed verified status until
   integration reports it. Do not clobber user's existing README edits.
 * `scripts/test_render_biomech.py`: tiny offline smoke/axis checks only.
-
-`scripts/biomech_experiment.py` (Claude Opus after model):
-
-* Build an actual biomechanical experiment CLI `--output DIR --muscle BIClong
-  [--joint elbow_flexion_r]`: source model, controlled independent-joint angle
-  sweep, activation levels0,.25,.5,1. Evaluate MuJoCo muscle force-length curves,
-  moment arms via tendon Jacobian (check derivative numerically), and joint
-  torque. Export CSV/NPZ and diagnostics with SI units, muscle parameters.
-  Source muscle names must be discovered, not assumed BIClong exact spelling.
-* Activation step at fixed pose: integrate activation dynamics with explicit
-  kinematic clamp and zero joint velocity, sample force over time, show
-  activation lag. This is an isometric bench test, not a free-body motion claim.
-* Include tension-only ligament length/force/energy sweeps or helper for them.
-  Write unit tests for finite outputs, moment-arm sign/derivative consistency and
-  activation transient. Supply a working force-production/mobility artifact,
-  not just a visual skeleton or imported unused model.
 
 ## Research sources already verified by lead
 
