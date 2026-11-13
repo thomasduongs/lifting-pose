@@ -2,12 +2,18 @@
 # Build the native biomech viewer in release mode and run it with the supplied arguments.
 # Default (no arguments): opens the recorded-motion replay. Use --simulation for the live arm
 # simulator, --snapshot PATH for a headless PNG. See docs/rust-viewer.md for all options.
+# --live routes to scripts/live_biomech.sh (camera split view); the remaining arguments are forwarded.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRATE="$ROOT/crates/biomech-viewer"
 BIN="$CRATE/target/release/biomech-viewer"
+
+if [ "${1:-}" = "--live" ]; then
+  shift
+  exec "$SCRIPT_DIR/live_biomech.sh" "$@"
+fi
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "view_biomech: cargo not found; install the Rust toolchain (https://rustup.rs)" >&2

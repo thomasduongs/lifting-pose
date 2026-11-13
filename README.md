@@ -8,8 +8,10 @@ separate ONNX Runtime installation is required.
 A skeletal twin fits the 3D observations using shared body dimensions and
 per-frame rotations, preserving bone lengths through forward kinematics.
 
-Open the anatomical model in the native Rust viewer with `./scripts/view_biomech.sh`.
-See [viewer controls and simulation mode](docs/rust-viewer.md).
+Open the live camera/anatomy split view with `./scripts/live_biomech.sh`:
+the anatomical model follows your arm pose on the left and the webcam stays live on the right.
+See [live controls](docs/live-biomech.md). The recorded anatomical viewer opens with
+`./scripts/view_biomech.sh`; see [viewer controls](docs/rust-viewer.md).
 
 
 ## MediaPipe Pose (default)

@@ -8,7 +8,11 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+biomech-lite = { path = "crates/biomech-lite" }
+biomech-viewer = { path = "crates/biomech-viewer" }
+font8x8 = "0.3"
 clap = { version = "4", features = ["derive"] }
+minifb = "0.29"
 opencv = { version = "0.101.1", default-features = false, features = ["clang-runtime", "dnn", "highgui", "imgcodecs", "imgproc", "video", "videoio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

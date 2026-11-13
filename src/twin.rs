@@ -1865,6 +1865,8 @@ impl Subject {
 
 #[derive(Default)]
 pub struct TwinRecorder {
+    streaming: bool,
+    streaming_segment: usize,
     subjects: Vec<Subject>,
     last_frame: Option<u64>,
     last_bbox: Option<Bbox>,
@@ -1893,6 +1895,14 @@ fn overlap(a: Bbox, b: Bbox) -> f32 {
     intersection / (a.width * a.height + b.width * b.height - intersection).max(f32::EPSILON)
 }
 impl TwinRecorder {
+    /// Preserve calibration and continuity without retaining a recording in memory.
+    pub fn streaming() -> Self {
+        Self {
+            streaming: true,
+            ..Self::default()
+        }
+    }
+
     pub fn set_stabilization(&mut self, enabled: bool, smooth: bool) {
         self.no_stabilization = !enabled;
         self.no_smoothing = !smooth;
@@ -2009,6 +2019,10 @@ impl TwinRecorder {
                 .last_bbox
                 .is_some_and(|previous| overlap(previous, bbox) < 0.15);
         if new {
+            if self.streaming && !self.subjects.is_empty() {
+                self.subjects.clear();
+                self.streaming_segment += 1;
+            }
             self.subjects.push(Subject {
                 calibration: Calibration::new(&obs),
                 hand_shapes: BTreeMap::new(),
@@ -2021,7 +2035,11 @@ impl TwinRecorder {
         self.last_frame = Some(frame);
         self.last_bbox = Some(bbox);
         self.last_size = Some(size);
-        let subject_segment = self.subjects.len() - 1;
+        let subject_segment = if self.streaming {
+            self.streaming_segment
+        } else {
+            self.subjects.len() - 1
+        };
         let subject = self.subjects.last_mut().unwrap();
         subject
             .calibration
@@ -2062,7 +2080,9 @@ impl TwinRecorder {
         };
         subject.previous = Some(solved);
         subject.previous_head = Some(head_solved);
-        subject.observations.push(obs);
+        if !self.streaming {
+            subject.observations.push(obs);
+        }
         Some(TwinPreview {
             subject_segment,
             provisional: true,
@@ -3185,6 +3205,112 @@ mod tests {
                 .is_some()
         );
         assert_eq!(recorder.subjects[0].observations[0].pixel_scores[12], 0.0);
+    }
+    #[test]
+    fn streaming_matches_recording_fit_without_retaining_frames() {
+        let source = observation(0, &Pose::default());
+        let pose = Pose3d {
+            ear_head: false,
+            model: "MediaPipe-Pose",
+            coordinate_space: "root_relative_camera",
+            units: "estimated_meters",
+            history_frames: 1,
+            angles: Vec::new(),
+            joints: (0..MODEL_N)
+                .map(|i| Joint3d {
+                    name: motion3d::NAMES[i],
+                    x: source.points[i].x as f32,
+                    y: source.points[i].y as f32,
+                    z: source.points[i].z as f32,
+                    input_score: if [9, 10, 14].contains(&i) { 0.9 } else { 0.0 },
+                })
+                .collect(),
+        };
+        let mut points = vec![
+            Keypoint {
+                name: "joint",
+                x: 320.0,
+                y: 240.0,
+                score: 0.0
+            };
+            17
+        ];
+        for (c, h) in [(5, 11), (6, 14), (7, 12), (8, 15), (9, 13), (10, 16)] {
+            points[c].x = source.pixels[h][0] as f32;
+            points[c].y = source.pixels[h][1] as f32;
+            points[c].score = 0.65;
+        }
+        let mut recording = TwinRecorder::default();
+        let mut streaming = TwinRecorder::streaming();
+        let bbox = Bbox {
+            x: 0.0,
+            y: 0.0,
+            width: 640.0,
+            height: 480.0,
+        };
+        for frame in 0..8 {
+            let a = recording
+                .observe(
+                    frame,
+                    frame as f64 / 30.0,
+                    &pose,
+                    &points,
+                    &[],
+                    None,
+                    bbox,
+                    source.size,
+                    0.3,
+                    Some(source.focal),
+                )
+                .unwrap();
+            let b = streaming
+                .observe(
+                    frame,
+                    frame as f64 / 30.0,
+                    &pose,
+                    &points,
+                    &[],
+                    None,
+                    bbox,
+                    source.size,
+                    0.3,
+                    Some(source.focal),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::to_value(&b).unwrap()
+            );
+            for (a, b) in a.fitted_pose.joints.iter().zip(&b.fitted_pose.joints) {
+                assert_eq!(
+                    [a.x, a.y, a.z, a.input_score],
+                    [b.x, b.y, b.z, b.input_score]
+                );
+            }
+            assert!(streaming.subjects[0].observations.is_empty());
+        }
+        assert_eq!(recording.subjects[0].observations.len(), 8);
+        assert_eq!(
+            recording.subjects[0].calibration.frames,
+            streaming.subjects[0].calibration.frames
+        );
+        let next = streaming
+            .observe(
+                100,
+                4.0,
+                &pose,
+                &points,
+                &[],
+                None,
+                bbox,
+                source.size,
+                0.3,
+                Some(source.focal),
+            )
+            .unwrap();
+        assert_eq!(next.subject_segment(), 1);
+        assert_eq!(streaming.subjects.len(), 1);
+        assert!(streaming.subjects[0].observations.is_empty());
     }
     #[test]
     fn visible_body_is_retained_when_native_joint_depth_has_been_rejected() {

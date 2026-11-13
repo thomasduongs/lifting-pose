@@ -17,11 +17,15 @@
 
 pub mod dynamics;
 pub mod kinematics;
+pub mod hand_fit;
+pub mod inverse;
+pub mod live_fit;
 pub mod model;
 pub mod muscle;
 pub mod wrapping;
 
 pub use kinematics::Kinematics;
+pub use live_fit::{FitResult, Landmark, LiveFitter, Observation};
 pub use model::{Body, Coupling, Geom, Joint, Model, Muscle, Site, Tendon, WrapPoint};
 pub use muscle::activation_dot;
 

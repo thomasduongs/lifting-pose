@@ -101,6 +101,26 @@ pub struct Renderer {
     pub cull_backfaces: bool,
     /// Raster threads for the bone pass (0 = available parallelism, capped at 8).
     pub threads: usize,
+    /// Per-muscle estimated activation in [0, 1]; `None` entry = unknown. `None` = uniform muscle color.
+    muscle_activity: Option<Vec<Option<f64>>>,
+}
+
+/// Estimated activation: blue -> green -> yellow -> orange -> red.
+const ACTIVITY_LOW: u32 = 0x3288ff;
+const ACTIVITY_HIGH: u32 = 0xff394f;
+const ACTIVITY_STOPS: [u32; 5] = [ACTIVITY_LOW, 0x39d98a, 0xffdf4d, 0xff922e, ACTIVITY_HIGH];
+const ACTIVITY_UNKNOWN: u32 = 0x3a3f4b;
+
+/// Color for one muscle's estimated activation (`None` = unknown). Values are clamped to [0, 1].
+pub fn muscle_activity_color(activity: Option<f64>) -> u32 {
+    match activity {
+        None => ACTIVITY_UNKNOWN,
+        Some(a) => {
+            let position = a.clamp(0.0, 1.0) * 4.0;
+            let band = (position.floor() as usize).min(3);
+            lerp_color(ACTIVITY_STOPS[band], ACTIVITY_STOPS[band + 1], position - band as f64)
+        },
+    }
 }
 
 #[inline]
@@ -269,9 +289,29 @@ impl Renderer {
             stats: RenderStats::default(),
             cull_backfaces: true,
             threads: 0,
+            muscle_activity: None,
         };
         r.resize(width, height);
         r
+    }
+
+    /// Sets per-muscle activation for coloring (`None` restores the uniform muscle color).
+    /// Each `Some` value must be finite and in [0, 1]; the length is checked against the model in `render`.
+    pub fn set_muscle_activity(&mut self, activity: Option<&[Option<f64>]>) -> Result<(), String> {
+        match activity {
+            None => self.muscle_activity = None,
+            Some(values) => {
+                for (i, v) in values.iter().enumerate() {
+                    if let Some(a) = v {
+                        if !a.is_finite() || !(0.0..=1.0).contains(a) {
+                            return Err(format!("muscle activity {i} = {a} must be finite in [0, 1]"));
+                        }
+                    }
+                }
+                self.muscle_activity = Some(values.to_vec());
+            }
+        }
+        Ok(())
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -403,6 +443,15 @@ impl Renderer {
             return Err("kinematics do not match the model".into());
         }
         visual.check_kinematics(kin)?;
+        if let Some(activity) = &self.muscle_activity {
+            if activity.len() != model.muscles.len() {
+                return Err(format!(
+                    "muscle activity has {} entries, model has {} muscles",
+                    activity.len(),
+                    model.muscles.len()
+                ));
+            }
+        }
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
@@ -438,7 +487,11 @@ impl Renderer {
                         continue;
                     }
                     let path = model.tendon_path(kin, m.tendon)?;
-                    self.polyline(&view, &path.points, 1.7 * scale, palette::MUSCLE, mode);
+                    let color = match &self.muscle_activity {
+                        Some(activity) => muscle_activity_color(activity[i]),
+                        None => palette::MUSCLE,
+                    };
+                    self.polyline(&view, &path.points, 1.7 * scale, color, mode);
                     self.stats.muscle_paths += 1;
                 }
                 if let Some(i) = options.selected_muscle {
@@ -594,5 +647,34 @@ impl Renderer {
                 self.segment(view, ca, cb, 1.0, c, Mode::Overlay, false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn activity_color_endpoints_midpoint_and_unknown() {
+        assert_eq!(muscle_activity_color(Some(0.0)), ACTIVITY_LOW);
+        assert_eq!(muscle_activity_color(Some(1.0)), ACTIVITY_HIGH);
+        assert_eq!(muscle_activity_color(None), ACTIVITY_UNKNOWN);
+        for (i, expected) in ACTIVITY_STOPS.iter().enumerate() {
+            assert_eq!(muscle_activity_color(Some(i as f64 / 4.0)), *expected);
+        }
+        assert_eq!(muscle_activity_color(Some(0.375)), lerp_color(ACTIVITY_STOPS[1], ACTIVITY_STOPS[2], 0.5));
+        assert_eq!(muscle_activity_color(Some(-0.1)), ACTIVITY_LOW);
+        assert_eq!(muscle_activity_color(Some(1.1)), ACTIVITY_HIGH);
+    }
+
+    #[test]
+    fn setter_rejects_invalid_activity_and_accepts_none() {
+        let mut r = Renderer::new(16, 16);
+        assert!(r.set_muscle_activity(Some(&[Some(0.0), None, Some(1.0)])).is_ok());
+        assert!(r.set_muscle_activity(Some(&[Some(1.5)])).is_err());
+        assert!(r.set_muscle_activity(Some(&[Some(-0.1)])).is_err());
+        assert!(r.set_muscle_activity(Some(&[Some(f64::NAN)])).is_err());
+        assert!(r.set_muscle_activity(Some(&[Some(f64::INFINITY)])).is_err());
+        assert!(r.set_muscle_activity(None).is_ok());
     }
 }

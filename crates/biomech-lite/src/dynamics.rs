@@ -71,7 +71,7 @@ fn dyn_qadr(model: &Model) -> Vec<usize> {
     model.dynamic_joints.iter().map(|&j| model.joints[j].qposadr).collect()
 }
 
-fn check_q(model: &Model, q: &[f64]) -> Result<(), String> {
+pub(crate) fn check_q(model: &Model, q: &[f64]) -> Result<(), String> {
     if q.len() != model.nq {
         return Err(format!("q length {} != nq {}", q.len(), model.nq));
     }
@@ -84,7 +84,7 @@ fn check_q(model: &Model, q: &[f64]) -> Result<(), String> {
     Ok(())
 }
 
-fn check_v(v: &[f64]) -> Result<(), String> {
+pub(crate) fn check_v(v: &[f64]) -> Result<(), String> {
     if v.len() != NX {
         return Err(format!("velocity length {} != {NX}", v.len()));
     }
@@ -249,7 +249,7 @@ pub fn bias(model: &Model, q: &[f64], v: &[f64]) -> Result<Vec<f64>, String> {
 }
 
 /// Tendon lengths, tendon-length Jacobian (ntendon x 8) and length velocities for velocity `v`.
-fn tendon_state(model: &Model, q: &[f64], v: &[f64]) -> Result<(Vec<f64>, DMatrix<f64>, Vec<f64>), String> {
+pub(crate) fn tendon_state(model: &Model, q: &[f64], v: &[f64]) -> Result<(Vec<f64>, DMatrix<f64>, Vec<f64>), String> {
     let len = model.tendon_lengths(&model.kinematics(q)?)?;
     let mut jt = DMatrix::zeros(model.tendons.len(), NX);
     for k in 0..NX {
@@ -295,7 +295,7 @@ pub fn passive_torque(model: &Model, q: &[f64], v: &[f64]) -> Result<Vec<f64>, S
     passive_from(model, q, v, &len, &jt, &vel)
 }
 
-fn passive_from(model: &Model, q: &[f64], v: &[f64], len: &[f64], jt: &DMatrix<f64>, vel: &[f64])
+pub(crate) fn passive_from(model: &Model, q: &[f64], v: &[f64], len: &[f64], jt: &DMatrix<f64>, vel: &[f64])
     -> Result<Vec<f64>, String> {
     let mut t = vec![0.0; NX];
     for (i, tn) in model.tendons.iter().enumerate() {
@@ -324,7 +324,7 @@ fn passive_from(model: &Model, q: &[f64], v: &[f64], len: &[f64], jt: &DMatrix<f
     Ok(t)
 }
 
-fn violation(model: &Model, q: &[f64]) -> Vec<f64> {
+pub(crate) fn violation(model: &Model, q: &[f64]) -> Vec<f64> {
     model.joints.iter().map(|j| {
         if j.is_scalar() && j.limited {
             let x = q[j.qposadr];

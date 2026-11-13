@@ -1,6 +1,9 @@
 mod accelerated;
 mod angles;
 mod avatar;
+mod biomech_estimate;
+mod biomech_live;
+mod biomech_live_capture;
 mod bundle;
 mod depth_path;
 mod details;
@@ -10,6 +13,7 @@ mod heading_path;
 mod image_motion;
 mod joint_tracking;
 mod landmarks;
+mod live_motion;
 mod live_preview;
 mod mediapipe;
 mod motion3d;
@@ -21,6 +25,7 @@ mod recording;
 mod replay;
 mod scope;
 mod tracking;
+mod tracking_pipeline;
 mod twin;
 #[cfg(test)]
 mod videopose3d;
@@ -69,6 +74,18 @@ struct Args {
     /// Stop camera recording after this many seconds; otherwise q / Esc stops it.
     #[arg(long, requires = "record", value_parser = parse_positive)]
     record_seconds: Option<f64>,
+    /// Live split view: anatomical model on the left, camera on the right. Nothing is recorded or saved.
+    #[arg(long, conflicts_with_all = ["record", "replay", "output", "json"])]
+    live_biomech: bool,
+    /// Biomech-lite model.json used by --live-biomech.
+    #[arg(long, default_value = "assets/biomech-lite/model.json")]
+    biomech_model: PathBuf,
+    /// Biomech visual.json used by --live-biomech.
+    #[arg(long, default_value = "assets/biomech-lite/visual.json")]
+    biomech_visual: PathBuf,
+    /// Headless: render one processed frame from --input (image or video) to this PNG, then exit.
+    #[arg(long, conflicts_with = "camera")]
+    live_snapshot: Option<PathBuf>,
     /// Replay the reusable save (or legacy twin JSON); overwrites output/replay.mp4.
     #[arg(long, num_args = 0..=1, default_missing_value = bundle::DEFAULT_SAVE, conflicts_with_all = ["record", "input", "camera"])]
     replay: Option<PathBuf>,
@@ -315,155 +332,26 @@ fn process(
     // Infer every crop from the original frame before adding any annotations.
     let mut people = Vec::with_capacity(crops.len());
     for (person_index, (bbox, detection_score)) in crops.into_iter().enumerate() {
-        let mut keypoints = estimator.infer(frame, bbox)?;
-        scope::mask_details(&mut keypoints);
-        if !args.full_body {
-            scope::mask_lower(&mut keypoints);
-        }
-        let mut occluded = if estimator.is_mediapipe() {
-            occlusion::mask_arm_overlap(&mut keypoints, frame.size()?)
-        } else {
-            [false; 17]
-        };
-        let hand_references = hand_model
-            .as_ref()
-            .map(|model| model.occlusion_references(time_seconds))
-            .unwrap_or_default();
-        let hands = match hand_model.as_mut() {
-            Some(model) => model.infer(
-                frame,
-                &keypoints,
-                time_seconds,
-                Some(bbox),
-                estimator.hand_crop_wrists().as_ref(),
-            )?,
-            None => Vec::new(),
-        };
-        if estimator.is_mediapipe() {
-            let recent = occlusion::mask_recent_hand_overlap(
-                &mut keypoints,
-                frame.size()?,
-                &hand_references,
-            );
-            for i in 0..17 {
-                occluded[i] |= recent[i];
-            }
-        }
-        let body_wrists = [keypoints[9], keypoints[10]];
-        let predicted_hands = hand_model
-            .as_ref()
-            .map(|model| model.predictions(time_seconds))
-            .unwrap_or_default();
-        estimator.confirm_hands(&hands);
-        if estimator.is_mediapipe() {
-            match &hand_model {
-                Some(model) => model.merge_landmarks(&mut keypoints, &hands, time_seconds),
-                None => details::merge_hand_landmarks(&mut keypoints, &hands),
-            }
-        }
-        let observed_keypoints = keypoints.clone();
-        let observed_native_scores = estimator.observed_native_scores();
-        let joint_frame =
-            estimator.stabilize(frame, &mut keypoints, time_seconds, bbox, &hands, &occluded)?;
-        let head = if args.head_orientation {
-            details::head_pose(&keypoints, args.threshold)
-        } else {
-            None
-        };
-        let angles = if args.full_body {
-            angles::calculate(&keypoints, args.threshold, frame.size()?)
-        } else {
-            angles::calculate_scoped(&keypoints, args.threshold, frame.size()?, true)
-        };
-        let mut pose3d = if args.no_3d {
-            None
-        } else if estimator.is_mediapipe() {
-            estimator.take_pose3d()
-        } else {
-            match lifter.as_mut() {
-                Some(lifter) => lifter.infer(&keypoints, bbox, frame.size()?, args.threshold)?,
-                None => None,
-            }
-        };
-        if estimator.is_mediapipe() {
-            if let Some(pose) = &mut pose3d {
-                for (coco, joint) in [(7, 12), (9, 13), (8, 15), (10, 16)] {
-                    if occluded[coco] {
-                        pose.joints[joint].input_score = 0.0;
-                    }
-                }
-                let width =
-                    (keypoints[5].x - keypoints[6].x).hypot(keypoints[5].y - keypoints[6].y);
-                for hand in &hands {
-                    let side = if hand.side == "left" { 0 } else { 1 };
-                    let old = body_wrists[side];
-                    let measured = keypoints[if side == 0 { 9 } else { 10 }];
-                    let wrist = [measured.x, measured.y];
-                    if (old.x - wrist[0]).hypot(old.y - wrist[1]) > (width * 0.3).max(40.0) {
-                        // The hand detector has located the wrist elsewhere. Keep
-                        // its reliable 2D constraint without trusting stale body depth.
-                        pose.joints[if side == 0 { 13 } else { 16 }].input_score = 0.0;
-                    }
-                }
-                pose.angles = motion3d::angles3d(&pose.joints, args.threshold);
-            }
-        }
-        let image_torso_scale = estimator.image_torso_scale();
-        let image_torso_reference_reset = estimator.image_torso_reference_reset();
-        let image_torso_span = estimator.image_torso_span();
-        twin_recorder.set_image_torso_scale(image_torso_scale, image_torso_span);
-        let twin = pose3d.as_ref().and_then(|pose| {
-            twin_recorder.observe(
-                index,
-                time_seconds,
-                pose,
-                &keypoints,
-                &hands,
-                head.clone(),
-                bbox,
-                Size::new(frame.cols(), frame.rows()),
-                args.threshold,
-                args.focal_length_px,
-            )
-        });
-        let tracking = if args.no_dimension_tracking || args.no_3d || estimator.is_mediapipe() {
-            None
-        } else {
-            Some(dimension_tracker.refine(
-                &keypoints,
-                twin.as_ref(),
-                bbox,
-                frame.size()?,
-                args.threshold,
-            ))
-        };
-        if detector.is_some() {
-            if let Some(next_crop) = tracking.as_ref().and_then(|t| t.next_crop) {
-                detection_cache.follow(next_crop);
-            }
-        }
-        people.push(PersonPose {
+        let person = tracking_pipeline::track_person(
+            frame,
+            estimator,
+            lifter,
+            hand_model,
+            twin_recorder,
+            dimension_tracker,
+            tracking_pipeline::Options::from(args),
+            index,
+            time_seconds,
             person_index,
             bbox,
             detection_score,
-            keypoints,
-            body_wrists,
-            observed_keypoints,
-            observed_native_scores,
-            joint_tracking: joint_frame.updates,
-            predicted_joints: joint_frame.predicted,
-            arm_refined: estimator.arm_refined().to_vec(),
-            angles,
-            pose3d,
-            twin,
-            tracking,
-            hands,
-            predicted_hands,
-            image_torso_scale,
-            image_torso_reference_reset,
-            image_torso_span,
-            head,
-        });
+        )?;
+        if detector.is_some() {
+            if let Some(next_crop) = person.tracking.as_ref().and_then(|t| t.next_crop) {
+                detection_cache.follow(next_crop);
+            }
+        }
+        people.push(person);
     }
     let inference_ms = start.elapsed().as_secs_f64() * 1000.0;
     if let Some(writer) = json {
@@ -571,10 +459,121 @@ fn opencv_thread_budget(requested: Option<i32>) -> i32 {
     })
 }
 
+/// True when the binary was launched as the macOS app's `live-biomech` executable
+/// (copied from this binary inside the bundle, so camera permission identity stays
+/// with the app bundle). Enables live mode without the `--live-biomech` flag.
+fn live_alias_launched() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|stem| stem == "live-biomech"))
+        .unwrap_or(false)
+}
+
+/// Resolves a live asset: an existing path (as given, relative to the working
+/// directory) wins, then the app bundle's `Contents/Resources`, then the project root.
+/// A path that resolves nowhere is an error that names the path as given.
+fn resolve_live_asset(path: &std::path::Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        ensure!(path.exists(), "Live asset not found: {}", path.display());
+        return Ok(path.to_path_buf());
+    }
+    if path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let mut candidates = Vec::new();
+    let bundle_resources = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .and_then(|dir| dir.parent())
+            .map(|contents| contents.join("Resources"))
+    });
+    if let Some(resources) = bundle_resources {
+        candidates.push(resources.join(path));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path));
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| anyhow::anyhow!("Live asset not found: {}", path.display()))
+}
+
 fn main() -> Result<()> {
     let mut args = Args::parse();
     opencv::core::set_num_threads(opencv_thread_budget(args.opencv_threads))?;
     accelerated::set_enabled(!args.no_acceleration);
+    let live = args.live_biomech || live_alias_launched();
+    if !live {
+        ensure!(
+            args.live_snapshot.is_none(),
+            "--live-snapshot requires --live-biomech"
+        );
+    }
+    if live {
+        ensure!(
+            args.record.is_none()
+                && args.replay.is_none()
+                && args.output.is_none()
+                && args.json.is_none(),
+            "Live mode does not record, replay, or write output; remove --record, --replay, --output, or --json"
+        );
+        ensure!(
+            args.live_snapshot.is_none() || args.input.is_some(),
+            "--live-snapshot requires --input (an image or video file); it never opens the camera"
+        );
+        ensure!(
+            args.live_snapshot.is_some() || !args.no_display,
+            "Live mode is a window and cannot honor --no-display; use --live-snapshot for headless output"
+        );
+        ensure!(
+            !args.no_3d,
+            "Live anatomical fitting requires 3D; remove --no-3d"
+        );
+        let arm_model = if args.no_arm_refinement {
+            None
+        } else {
+            Some(resolve_live_asset(
+                args.arm_model
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("models/rtmpose-m.onnx")),
+            )?)
+        };
+        return biomech_live::run(biomech_live::Config {
+            capture: biomech_live_capture::Config {
+                camera: args.camera.unwrap_or(0),
+                input: args.input.clone(),
+                pose_model: resolve_live_asset(&args.model)?,
+                detector_model: if args.no_detection || args.bbox.is_some() {
+                    args.detector_model.clone()
+                } else {
+                    resolve_live_asset(&args.detector_model)?
+                },
+                no_detection: args.no_detection || args.bbox.is_some(),
+                arm_model,
+                hand_model: if args.no_hands {
+                    None
+                } else {
+                    Some(resolve_live_asset(&args.hand_model)?)
+                },
+                motion_model: resolve_live_asset(&args.motion_model)?,
+                options: tracking_pipeline::Options {
+                    image_support_floor: Some(args.threshold.max(0.55)),
+                    ..tracking_pipeline::Options::from(&args)
+                },
+                stabilization: !args.no_stabilization,
+                smoothing: !args.no_smoothing,
+                upright_torso: !args.free_torso,
+                acceleration: !args.no_acceleration,
+                bbox: args.bbox,
+                detection_interval: args.detection_interval,
+                detection_threshold: args.detection_threshold,
+                nms_threshold: args.nms_threshold,
+                opencv_threads: opencv_thread_budget(args.opencv_threads),
+            },
+            model: resolve_live_asset(&args.biomech_model)?,
+            visual: resolve_live_asset(&args.biomech_visual)?,
+            max_frames: args.max_frames,
+            snapshot: args.live_snapshot.clone(),
+        });
+    }
     if let Some(path) = &args.replay {
         let output = args
             .output
